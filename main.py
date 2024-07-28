@@ -211,6 +211,9 @@ class MCTS:
         self.max_depth = max_depth if max_depth is not None else n_simulations
         self.tree = Tree(self.n_simulations + 1, self.n_actions, self.root_fn_output)
 
+    def run(self, key: PRNGKeyArray):
+        pass
+
     def _simulation(
         self, action_selection_fn: ActionSelectionFn, key: PRNGKeyArray
     ) -> SimulationState:
@@ -222,6 +225,7 @@ class MCTS:
         def body(state: SimulationState) -> SimulationState:
             key, subkey = jax.random.split(state.key)
             node_index = state.next_node_index
+
             action = action_selection_fn(
                 self.tree,
                 current_node_index=node_index,
@@ -229,9 +233,11 @@ class MCTS:
             )
 
             next_node_index = self.tree.children_index[state.node_index, action]
+
             continue_simulation = jnp.logical_and(
-                state.depth + 1 < self.max_depth, next_node_index == UNVISITED_NODE
+                state.depth + 1 < self.max_depth, next_node_index != UNVISITED_NODE
             )
+
             next_state = SimulationState(
                 node_index=node_index,
                 action=action,
@@ -250,7 +256,6 @@ class MCTS:
             continue_simulation=jnp.array(True),
             key=key,
         )
-
         end_state = jax.lax.while_loop(
             cond_fun=(lambda s: s.continue_simulation),
             body_fun=body,
