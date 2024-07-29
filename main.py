@@ -1,15 +1,14 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import pgx
 from beartype import beartype
 from beartype.typing import Any, Callable, NamedTuple, Protocol, runtime_checkable
-from jax._src.pjit import PytreeLeaf
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray, PyTree
-from typing_extensions import ParamSpec
 
 # === Very simple environment ===
 # The environment tree looks like this:
@@ -28,6 +27,8 @@ ROOT_NODE = jnp.array(0)
 
 
 class RandomWalkEnv:
+    n_actions: int = 2
+
     def __init__(self) -> None:
         pass
 
@@ -35,8 +36,6 @@ class RandomWalkEnv:
         return jnp.array(0)
 
     def step(self, state: Array, action: Array) -> tuple[Array, Array, Bool]:
-        assert state in [0, 1, 2], "Invalid state."
-        assert action in [0, 1], "Invalid action."
         if state == 0:
             if action == 0:
                 return (
@@ -105,8 +104,7 @@ def ucb1(
     )
 
 
-@dataclass
-class RootFnOutput:
+class RootFnOutput(NamedTuple):
     params: PyTree
     value: Array
     state_embedding: PyTree
@@ -136,12 +134,10 @@ class StepFnCallable(Protocol):
     ) -> StepFnOutput: ...
 
 
-@dataclass
-class Tree:
+class Tree(eqx.Module):
     node_values: Float[Array, " N"]
     node_visits: Int[Array, " N"]
     parent_indices: Int[Array, " N"]
-    states: PyTree
     action_from_parent: Int[Array, " N"]
     children_index: Int[Array, "N A"]
     children_visits: Int[Array, "N A"]
@@ -150,8 +146,8 @@ class Tree:
     children_discounts: Float[Array, "N A"]
     children_priors: Float[Array, "N A"]
 
-    N: int
-    A: int
+    N: int = eqx.field(static=True)
+    A: int = eqx.field(static=True)
 
     root_fn_output: RootFnOutput
 
@@ -190,6 +186,12 @@ class SimulationState(NamedTuple):
     key: PRNGKeyArray
 
 
+class SearchState(NamedTuple):
+    tree: Tree
+    state_embedding: PyTree
+    key: PRNGKeyArray
+
+
 @beartype
 class MCTS:
     n_simulations: int
@@ -211,8 +213,87 @@ class MCTS:
         self.max_depth = max_depth if max_depth is not None else n_simulations
         self.tree = Tree(self.n_simulations + 1, self.n_actions, self.root_fn_output)
 
-    def run(self, key: PRNGKeyArray):
-        pass
+    def run(
+        self,
+        action_selection_fn: ActionSelectionFn,
+        step_fn: StepFnCallable,
+        key: PRNGKeyArray,
+    ) -> Tree:
+        def body(i: int, state: SearchState):
+            key, simulation_key, expand_key, next_key = jax.random.split(state.key, 4)
+            end_state = self._simulation(action_selection_fn, simulation_key)
+            parent_index, action = end_state.node_index, end_state.action
+            next_node_index = state.tree.children_index[parent_index, action]
+            next_node_index = jnp.where(
+                next_node_index == UNVISITED_NODE,
+                i + 1,
+                next_node_index,
+            )
+            tree, next_state_embedding = self._expand(
+                step_fn,
+                state.tree,
+                parent_index,
+                action,
+                next_node_index,
+                state.state_embedding,
+                expand_key,
+            )
+            return SearchState(tree, next_state_embedding, next_key)
+
+        initial_state = SearchState(self.tree, self.root_fn_output.state_embedding, key)
+        _, final_state = jax.lax.fori_loop(0, self.n_simulations, body, initial_state)
+        return final_state.tree
+
+    def _expand(
+        self,
+        step_fn: StepFnCallable,
+        tree: Tree,
+        parent_index: Int[Array, ""],
+        action_to_expand: Int[Array, ""],
+        next_node_index: Int[Array, ""],
+        state_embedding: PyTree,
+        key: PRNGKeyArray,
+    ) -> tuple[Tree, PyTree]:
+        key, subkey = jax.random.split(key)
+
+        print(
+            tree.root_fn_output.params.shape,
+            action_to_expand.shape,
+            state_embedding,
+            subkey,
+        )
+        step_fn_output = step_fn(
+            tree.root_fn_output.params,
+            action_to_expand,
+            state_embedding,
+            subkey,
+        )
+        tree.node_values = tree.node_values.at[next_node_index].set(
+            step_fn_output.value
+        )
+        tree.children_rewards = tree.children_rewards.at[
+            next_node_index, action_to_expand
+        ].set(step_fn_output.reward)
+
+        tree.children_discounts = tree.children_discounts.at[
+            next_node_index, action_to_expand
+        ].set(step_fn_output.discount)
+
+        tree.children_priors = tree.children_priors.at[
+            next_node_index, action_to_expand
+        ].set(step_fn_output.priors)
+
+        tree.node_visits = tree.node_visits.at[next_node_index].add(1)
+
+        tree.children_index = tree.children_index.at[
+            parent_index, action_to_expand
+        ].set(next_node_index)
+
+        tree.parent_indices = tree.parent_indices.at[next_node_index].set(parent_index)
+        tree.action_from_parent = tree.action_from_parent.at[next_node_index].set(
+            action_to_expand
+        )
+        return tree, step_fn_output.state_embedding
 
     def _simulation(
         self, action_selection_fn: ActionSelectionFn, key: PRNGKeyArray
@@ -290,5 +371,34 @@ def action_selected_fn(
     return jnp.argmax(ucbs)
 
 
-end_state = mcts._simulation(action_selection_fn=action_selected_fn, key=key)
-print(end_state)
+def rollout_randomly(env: RandomWalkEnv, current_state: Array, key: PRNGKeyArray):
+    total_reward = 0
+    while True:
+        key, subkey = jax.random.split(key)
+        action = jax.random.randint(subkey, (), 0, env.n_actions)
+        next_state, reward, done = env.step(current_state, action)
+        current_state = next_state
+        total_reward += reward
+        if done:
+            break
+    return jnp.array(total_reward)
+
+
+def step_function(
+    env, params: PyTree, action: Array, state_embedding: PyTree, key: PRNGKeyArray
+) -> StepFnOutput:
+    next_state, reward, done = env.step(state_embedding, action)
+    value = rollout_randomly(env, next_state, key)
+    discount = jnp.where(done, jnp.array(0.0), jnp.array(1.0))
+    priors = jnp.array(0.5)
+    return StepFnOutput(
+        value=value,
+        reward=reward,
+        discount=discount,
+        priors=priors,
+        state_embedding=next_state,
+    )
+
+
+step_fn_partial = partial(step_function, RandomWalkEnv())
+mcts.run(action_selected_fn, step_fn_partial, key)
