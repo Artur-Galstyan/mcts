@@ -1,3 +1,5 @@
+import os
+import webbrowser
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import partial
@@ -6,9 +8,20 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import pgx
+import treescope
 from beartype import beartype
 from beartype.typing import Any, Callable, NamedTuple, Protocol, runtime_checkable
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray, PyTree
+from loguru import logger
+
+
+def jax_log(fmt: str, *args, **kwargs):
+    jax.debug.callback(
+        lambda *args, **kwargs: logger.info(fmt.format(*args, **kwargs)),
+        *args,
+        **kwargs,
+    )
+
 
 # === Very simple environment ===
 # The environment tree looks like this:
@@ -36,45 +49,25 @@ class RandomWalkEnv:
         return jnp.array(0)
 
     def step(self, state: Array, action: Array) -> tuple[Array, Array, Bool]:
-        if state == 0:
-            if action == 0:
-                return (
-                    jnp.array(1, dtype=jnp.int32),
-                    jnp.array(0, dtype=jnp.int32),
-                    jnp.array(False, dtype=jnp.bool),
-                )
-            else:
-                return (
-                    jnp.array(2, dtype=jnp.int32),
-                    jnp.array(0),
-                    jnp.array(False, dtype=jnp.bool),
-                )
-        elif state == 1:
-            if action == 0:
-                return (
-                    jnp.array(3, dtype=jnp.int32),
-                    jnp.array(0),
-                    jnp.array(True, dtype=jnp.bool),
-                )
-            else:
-                return (
-                    jnp.array(4, dtype=jnp.int32),
-                    jnp.array(0),
-                    jnp.array(True, dtype=jnp.bool),
-                )
-        else:
-            if action == 0:
-                return (
-                    jnp.array(5, dtype=jnp.int32),
-                    jnp.array(1),
-                    jnp.array(True, dtype=jnp.bool),
-                )
-            else:
-                return (
-                    jnp.array(6, dtype=jnp.int32),
-                    jnp.array(0),
-                    jnp.array(True, dtype=jnp.bool),
-                )
+        def state_0(action):
+            next_state = jnp.where(action == 0, 1, 2)
+            reward = jnp.zeros_like(action)
+            done = jnp.zeros_like(action, dtype=jnp.bool_)
+            return next_state, reward, done
+
+        def state_1(action):
+            next_state = jnp.where(action == 0, 3, 4)
+            reward = jnp.zeros_like(action)
+            done = jnp.ones_like(action, dtype=jnp.bool_)
+            return next_state, reward, done
+
+        def state_other(action):
+            next_state = jnp.where(action == 0, 5, 6)
+            reward = jnp.where(action == 0, 1, 0)
+            done = jnp.ones_like(action, dtype=jnp.bool_)
+            return next_state, reward, done
+
+        return jax.lax.switch(state, [state_0, state_1, state_other], action)
 
 
 # === END ===
@@ -219,15 +212,27 @@ class MCTS:
         step_fn: StepFnCallable,
         key: PRNGKeyArray,
     ) -> Tree:
+        logger.info("Running MCTS")
+
         def body(i: int, state: SearchState):
             key, simulation_key, expand_key, next_key = jax.random.split(state.key, 4)
+            jax_log("MCTS.run.body: Search iteration {i}", i=i)
             end_state = self._simulation(action_selection_fn, simulation_key)
             parent_index, action = end_state.node_index, end_state.action
+            jax_log(
+                "MCTS.run.body: Simulation end state: parent_index={parent_index}, action={action}",
+                parent_index=parent_index,
+                action=action,
+            )
             next_node_index = state.tree.children_index[parent_index, action]
             next_node_index = jnp.where(
                 next_node_index == UNVISITED_NODE,
                 i + 1,
                 next_node_index,
+            )
+            jax_log(
+                "MCTS.run.body: Next node index: {next_node_index}",
+                next_node_index=next_node_index,
             )
             tree, next_state_embedding = self._expand(
                 step_fn,
@@ -241,7 +246,7 @@ class MCTS:
             return SearchState(tree, next_state_embedding, next_key)
 
         initial_state = SearchState(self.tree, self.root_fn_output.state_embedding, key)
-        _, final_state = jax.lax.fori_loop(0, self.n_simulations, body, initial_state)
+        final_state = jax.lax.fori_loop(0, self.n_simulations, body, initial_state)
         return final_state.tree
 
     def _expand(
@@ -255,12 +260,10 @@ class MCTS:
         key: PRNGKeyArray,
     ) -> tuple[Tree, PyTree]:
         key, subkey = jax.random.split(key)
-
-        print(
-            tree.root_fn_output.params.shape,
-            action_to_expand.shape,
-            state_embedding,
-            subkey,
+        jax_log(
+            "MCTS._expand: Expanding node {parent_index} with action {action_to_expand}",
+            parent_index=parent_index,
+            action_to_expand=action_to_expand,
         )
         step_fn_output = step_fn(
             tree.root_fn_output.params,
@@ -268,31 +271,76 @@ class MCTS:
             state_embedding,
             subkey,
         )
-        tree.node_values = tree.node_values.at[next_node_index].set(
-            step_fn_output.value
+        # reward: Array
+        # discount: Array
+        # value: Array
+        # priors: Array
+
+        # state_embedding: PyTree
+
+        jax_log(
+            "MCTS._expand: Step function output: reward={reward}, discount={discount}, value={value}, priors={priors}, state_embedding={state_embedding}",
+            reward=step_fn_output.reward,
+            discount=step_fn_output.discount,
+            value=step_fn_output.value,
+            priors=step_fn_output.priors,
+            state_embedding=state_embedding,
         )
-        tree.children_rewards = tree.children_rewards.at[
-            next_node_index, action_to_expand
-        ].set(step_fn_output.reward)
 
-        tree.children_discounts = tree.children_discounts.at[
-            next_node_index, action_to_expand
-        ].set(step_fn_output.discount)
-
-        tree.children_priors = tree.children_priors.at[
-            next_node_index, action_to_expand
-        ].set(step_fn_output.priors)
-
-        tree.node_visits = tree.node_visits.at[next_node_index].add(1)
-
-        tree.children_index = tree.children_index.at[
-            parent_index, action_to_expand
-        ].set(next_node_index)
-
-        tree.parent_indices = tree.parent_indices.at[next_node_index].set(parent_index)
-        tree.action_from_parent = tree.action_from_parent.at[next_node_index].set(
-            action_to_expand
+        tree = eqx.tree_at(
+            lambda t: t.node_values,
+            tree,
+            tree.node_values.at[next_node_index].set(step_fn_output.value),
         )
+
+        tree = eqx.tree_at(
+            lambda t: t.children_rewards,
+            tree,
+            tree.children_rewards.at[next_node_index, action_to_expand].set(
+                step_fn_output.reward
+            ),
+        )
+
+        tree = eqx.tree_at(
+            lambda t: t.children_discounts,
+            tree,
+            tree.children_discounts.at[next_node_index, action_to_expand].set(
+                step_fn_output.discount
+            ),
+        )
+
+        tree = eqx.tree_at(
+            lambda t: t.children_priors,
+            tree,
+            tree.children_priors.at[next_node_index, action_to_expand].set(
+                step_fn_output.priors
+            ),
+        )
+
+        tree = eqx.tree_at(
+            lambda t: t.node_visits,
+            tree,
+            tree.node_visits.at[parent_index].add(1),
+        )
+
+        tree = eqx.tree_at(
+            lambda t: t.children_index,
+            tree,
+            tree.children_index.at[parent_index, action_to_expand].set(next_node_index),
+        )
+
+        tree = eqx.tree_at(
+            lambda t: t.parent_indices,
+            tree,
+            tree.parent_indices.at[next_node_index].set(parent_index),
+        )
+
+        tree = eqx.tree_at(
+            lambda t: t.action_from_parent,
+            tree,
+            tree.action_from_parent.at[next_node_index].set(action_to_expand),
+        )
+
         return tree, step_fn_output.state_embedding
 
     def _simulation(
@@ -306,6 +354,13 @@ class MCTS:
         def body(state: SimulationState) -> SimulationState:
             key, subkey = jax.random.split(state.key)
             node_index = state.next_node_index
+            jax_log(
+                "MCTS._simulation.body: Simulation depth {depth}", depth=state.depth
+            )
+            jax_log(
+                "MCTS._simulation.body: Simulation node_index {node_index}",
+                node_index=node_index,
+            )
 
             action = action_selection_fn(
                 self.tree,
@@ -313,10 +368,22 @@ class MCTS:
                 current_depth=state.depth,
             )
 
+            jax_log("MCTS._simulation.body: Simulation action {action}", action=action)
+
             next_node_index = self.tree.children_index[state.node_index, action]
+
+            jax_log(
+                "MCTS._simulation.body: Simulation next_node_index {next_node_index}",
+                next_node_index=next_node_index,
+            )
 
             continue_simulation = jnp.logical_and(
                 state.depth + 1 < self.max_depth, next_node_index != UNVISITED_NODE
+            )
+
+            jax_log(
+                "MCTS._simulation.body: Simulation continue_simulation {continue_simulation}",
+                continue_simulation=continue_simulation,
             )
 
             next_state = SimulationState(
@@ -371,17 +438,28 @@ def action_selected_fn(
     return jnp.argmax(ucbs)
 
 
-def rollout_randomly(env: RandomWalkEnv, current_state: Array, key: PRNGKeyArray):
-    total_reward = 0
-    while True:
+def rollout_randomly(
+    env, current_state: jnp.ndarray, key: jnp.ndarray, max_steps: int = 1000
+):
+    def body_fun(carry, _):
+        current_state, total_reward, key, done = carry
         key, subkey = jax.random.split(key)
         action = jax.random.randint(subkey, (), 0, env.n_actions)
-        next_state, reward, done = env.step(current_state, action)
-        current_state = next_state
-        total_reward += reward
-        if done:
-            break
-    return jnp.array(total_reward)
+        next_state, reward, new_done = env.step(current_state, action)
+
+        # Update only if not already done
+        current_state = jnp.where(done, current_state, next_state)
+        total_reward = jnp.where(done, total_reward, total_reward + reward)
+        done = jnp.logical_or(done, new_done)
+
+        return (current_state, total_reward, key, done), None
+
+    initial_carry = (current_state, jnp.array(0.0), key, jnp.array(False))
+    (final_state, total_reward, final_key, done), _ = jax.lax.scan(
+        body_fun, initial_carry, None, length=max_steps
+    )
+
+    return total_reward
 
 
 def step_function(
@@ -401,4 +479,10 @@ def step_function(
 
 
 step_fn_partial = partial(step_function, RandomWalkEnv())
-mcts.run(action_selected_fn, step_fn_partial, key)
+final_state = mcts.run(action_selected_fn, step_fn_partial, key)
+# with treescope.active_autovisualizer.set_scoped(treescope.ArrayAutovisualizer()):
+#     contents = treescope.render_to_html(final_state)
+
+# with open("/tmp/treescope_output.html", "w") as f:
+#     f.write(contents)
+#     webbrowser.open("file://" + os.path.realpath("/tmp/treescope_output.html"))
