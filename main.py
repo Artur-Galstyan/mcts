@@ -1,16 +1,10 @@
-import os
-import webbrowser
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import partial
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import pgx
-import treescope
-from beartype import beartype
-from beartype.typing import Any, Callable, NamedTuple, Protocol, runtime_checkable
+from beartype.typing import Any, NamedTuple, Protocol
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray, PyTree
 from loguru import logger
 
@@ -146,7 +140,7 @@ class Tree(eqx.Module):
 
     def __init__(self, N: int, A: int, root_fn_output: RootFnOutput):
         self.node_visits = jnp.zeros(shape=(N,), dtype=jnp.int32)
-        self.parent_indices = jnp.zeros(shape=(N,), dtype=jnp.int32).at[0].set(-1)
+        self.parent_indices = jnp.ones(shape=(N,), dtype=jnp.int32) * NO_PARENT
         self.action_from_parent = jnp.zeros(shape=(N,), dtype=jnp.int32).at[0].set(-1)
         self.children_index = jnp.ones(shape=(N, A), dtype=jnp.int32) * UNVISITED_NODE
         self.children_visits = jnp.zeros(shape=(N, A), dtype=jnp.int32)
@@ -158,6 +152,9 @@ class Tree(eqx.Module):
         self.node_values = jnp.zeros(shape=(N,)).at[0].set(self.root_fn_output.value)
         self.N = N
         self.A = A
+
+    def __str__(self) -> str:
+        return f"Tree(N={self.N}, A={self.A}, children_index={self.children_index})"
 
 
 class ActionSelectionFn(Protocol):
@@ -185,231 +182,260 @@ class SearchState(NamedTuple):
     key: PRNGKeyArray
 
 
-@beartype
-class MCTS:
-    n_simulations: int
-    n_actions: int
-    max_depth: int
-    root_fn_output: RootFnOutput
-    tree: Tree
+def run(
+    action_selection_fn: ActionSelectionFn,
+    step_fn: StepFnCallable,
+    root_fn_output: RootFnOutput,
+    max_depth: int,
+    n_simulations: int,
+    n_actions: int,
+    key: PRNGKeyArray,
+) -> Tree:
+    logger.info("Running MCTS")
 
-    def __init__(
-        self,
-        n_simulations: int,
-        n_actions: int,
-        root_fn: RootFnOutput,
-        max_depth: int | None = None,
-    ) -> None:
-        self.root_fn_output = root_fn
-        self.n_simulations = n_simulations
-        self.n_actions = n_actions
-        self.max_depth = max_depth if max_depth is not None else n_simulations
-        self.tree = Tree(self.n_simulations + 1, self.n_actions, self.root_fn_output)
+    init_tree = Tree(n_simulations + 1, n_actions, root_fn_output)
 
-    def run(
-        self,
-        action_selection_fn: ActionSelectionFn,
-        step_fn: StepFnCallable,
-        key: PRNGKeyArray,
-    ) -> Tree:
-        logger.info("Running MCTS")
-
-        def body(i: int, state: SearchState):
-            key, simulation_key, expand_key, next_key = jax.random.split(state.key, 4)
-            jax_log("MCTS.run.body: Search iteration {i}", i=i)
-            end_state = self._simulation(action_selection_fn, simulation_key)
-            parent_index, action = end_state.node_index, end_state.action
-            jax_log(
-                "MCTS.run.body: Simulation end state: parent_index={parent_index}, action={action}",
-                parent_index=parent_index,
-                action=action,
-            )
-            next_node_index = state.tree.children_index[parent_index, action]
-            next_node_index = jnp.where(
-                next_node_index == UNVISITED_NODE,
-                i + 1,
-                next_node_index,
-            )
-            jax_log(
-                "MCTS.run.body: Next node index: {next_node_index}",
-                next_node_index=next_node_index,
-            )
-            tree, next_state_embedding = self._expand(
-                step_fn,
-                state.tree,
-                parent_index,
-                action,
-                next_node_index,
-                state.state_embedding,
-                expand_key,
-            )
-            return SearchState(tree, next_state_embedding, next_key)
-
-        initial_state = SearchState(self.tree, self.root_fn_output.state_embedding, key)
-        final_state = jax.lax.fori_loop(0, self.n_simulations, body, initial_state)
-        return final_state.tree
-
-    def _expand(
-        self,
-        step_fn: StepFnCallable,
-        tree: Tree,
-        parent_index: Int[Array, ""],
-        action_to_expand: Int[Array, ""],
-        next_node_index: Int[Array, ""],
-        state_embedding: PyTree,
-        key: PRNGKeyArray,
-    ) -> tuple[Tree, PyTree]:
-        key, subkey = jax.random.split(key)
+    def body(i: int, state: SearchState):
+        key, simulation_key, expand_key, next_key = jax.random.split(state.key, 4)
+        jax_log("MCTS.run.body: Search iteration {i}", i=i)
+        end_state = _simulation(
+            state.tree, action_selection_fn, max_depth, simulation_key
+        )
+        parent_index, action = end_state.node_index, end_state.action
         jax_log(
-            "MCTS._expand: Expanding node {parent_index} with action {action_to_expand}",
+            "MCTS.run.body: Simulation end state: parent_index={parent_index}, action={action}",
             parent_index=parent_index,
-            action_to_expand=action_to_expand,
+            action=action,
         )
-        step_fn_output = step_fn(
-            tree.root_fn_output.params,
-            action_to_expand,
-            state_embedding,
-            subkey,
+        next_node_index = state.tree.children_index[parent_index, action]
+        jax_log(
+            "MCTS.run.body: (Before) Next node index: {next_node_index}",
+            next_node_index=next_node_index,
         )
-        # reward: Array
-        # discount: Array
-        # value: Array
-        # priors: Array
 
-        # state_embedding: PyTree
+        next_node_index = jnp.where(
+            next_node_index == UNVISITED_NODE,
+            i + 1,
+            next_node_index,
+        )
+        jax_log(
+            "MCTS.run.body: (After) Next node index: {next_node_index}",
+            next_node_index=next_node_index,
+        )
+        updated_tree, next_state_embedding = _expand(
+            step_fn,
+            state.tree,
+            parent_index,
+            action,
+            next_node_index,
+            state.state_embedding,
+            expand_key,
+        )
+        return SearchState(updated_tree, next_state_embedding, next_key)
+
+    initial_state = SearchState(init_tree, root_fn_output.state_embedding, key)
+    final_state = jax.lax.fori_loop(0, n_simulations, body, initial_state)
+    return final_state.tree
+
+
+def _expand(
+    step_fn: StepFnCallable,
+    tree: Tree,
+    parent_index: Int[Array, ""],
+    action_to_expand: Int[Array, ""],
+    next_node_index: Int[Array, ""],
+    state_embedding: PyTree,
+    key: PRNGKeyArray,
+) -> tuple[Tree, PyTree]:
+    key, subkey = jax.random.split(key)
+    jax_log(
+        "MCTS._expand: Expanding node {parent_index} with action {action_to_expand}",
+        parent_index=parent_index,
+        action_to_expand=action_to_expand,
+    )
+    step_fn_output = step_fn(
+        tree.root_fn_output.params,
+        action_to_expand,
+        state_embedding,
+        subkey,
+    )
+
+    jax_log(
+        "MCTS._expand: Step function output: reward={reward}, discount={discount}, value={value}, priors={priors}, state_embedding={state_embedding}",
+        reward=step_fn_output.reward,
+        discount=step_fn_output.discount,
+        value=step_fn_output.value,
+        priors=step_fn_output.priors,
+        state_embedding=state_embedding,
+    )
+
+    tree = eqx.tree_at(
+        lambda t: t.node_values,
+        tree,
+        tree.node_values.at[next_node_index].set(step_fn_output.value),
+    )
+
+    jax_log(
+        "MCTS._expand: Updated node values: {node_values}",
+        node_values=tree.node_values,
+    )
+
+    tree = eqx.tree_at(
+        lambda t: t.children_rewards,
+        tree,
+        tree.children_rewards.at[next_node_index, action_to_expand].set(
+            step_fn_output.reward
+        ),
+    )
+
+    jax_log(
+        "MCTS._expand: Updated children rewards: {children_rewards}",
+        children_rewards=tree.children_rewards,
+    )
+
+    tree = eqx.tree_at(
+        lambda t: t.children_discounts,
+        tree,
+        tree.children_discounts.at[next_node_index, action_to_expand].set(
+            step_fn_output.discount
+        ),
+    )
+
+    jax_log(
+        "MCTS._expand: Updated children discounts: {children_discounts}",
+        children_discounts=tree.children_discounts,
+    )
+
+    tree = eqx.tree_at(
+        lambda t: t.children_priors,
+        tree,
+        tree.children_priors.at[next_node_index, action_to_expand].set(
+            step_fn_output.priors
+        ),
+    )
+
+    jax_log(
+        "MCTS._expand: Updated children priors: {children_priors}",
+        children_priors=tree.children_priors,
+    )
+
+    tree = eqx.tree_at(
+        lambda t: t.node_visits,
+        tree,
+        tree.node_visits.at[parent_index].add(1),
+    )
+
+    jax_log(
+        "MCTS._expand: Updated node visits: {node_visits}",
+        node_visits=tree.node_visits,
+    )
+
+    tree = eqx.tree_at(
+        lambda t: t.children_index,
+        tree,
+        tree.children_index.at[parent_index, action_to_expand].set(next_node_index),
+    )
+
+    jax_log(
+        "MCTS._expand: Updated children index: {children_index}",
+        children_index=tree.children_index,
+    )
+
+    tree = eqx.tree_at(
+        lambda t: t.parent_indices,
+        tree,
+        tree.parent_indices.at[next_node_index].set(parent_index),
+    )
+
+    jax_log(
+        "MCTS._expand: Updated parent indices: {parent_indices}",
+        parent_indices=tree.parent_indices,
+    )
+
+    tree = eqx.tree_at(
+        lambda t: t.action_from_parent,
+        tree,
+        tree.action_from_parent.at[next_node_index].set(action_to_expand),
+    )
+
+    jax_log(
+        "MCTS._expand: Updated action from parent: {action_from_parent}",
+        action_from_parent=tree.action_from_parent,
+    )
+
+    return tree, step_fn_output.state_embedding
+
+
+def _simulation(
+    tree: Tree,
+    action_selection_fn: ActionSelectionFn,
+    max_depth: int,
+    key: PRNGKeyArray,
+) -> SimulationState:
+    """
+    Traverse the tree until an unvisited leaf node is reached (or `max_depth`
+    was reached).
+    """
+
+    jax_log("MCTS._simulation: Got this tree: {tree}", tree=tree)
+
+    def body(state: SimulationState) -> SimulationState:
+        key, subkey = jax.random.split(state.key)
+        node_index = state.next_node_index
+        jax_log("MCTS._simulation.body: Simulation depth {depth}", depth=state.depth)
+        jax_log(
+            "MCTS._simulation.body: Simulation node_index {node_index}",
+            node_index=node_index,
+        )
+
+        action = action_selection_fn(
+            tree,
+            current_node_index=node_index,
+            current_depth=state.depth,
+        )
+
+        jax_log("MCTS._simulation.body: Simulation action {action}", action=action)
+
+        next_node_index = tree.children_index[node_index, action]
 
         jax_log(
-            "MCTS._expand: Step function output: reward={reward}, discount={discount}, value={value}, priors={priors}, state_embedding={state_embedding}",
-            reward=step_fn_output.reward,
-            discount=step_fn_output.discount,
-            value=step_fn_output.value,
-            priors=step_fn_output.priors,
-            state_embedding=state_embedding,
+            "MCTS._simulation.body: Simulation next_node_index {next_node_index}",
+            next_node_index=next_node_index,
         )
 
-        tree = eqx.tree_at(
-            lambda t: t.node_values,
-            tree,
-            tree.node_values.at[next_node_index].set(step_fn_output.value),
+        continue_simulation = jnp.logical_and(
+            state.depth + 1 < max_depth, next_node_index != UNVISITED_NODE
         )
 
-        tree = eqx.tree_at(
-            lambda t: t.children_rewards,
-            tree,
-            tree.children_rewards.at[next_node_index, action_to_expand].set(
-                step_fn_output.reward
-            ),
+        jax_log(
+            "MCTS._simulation.body: Simulation continue_simulation {continue_simulation}",
+            continue_simulation=continue_simulation,
         )
 
-        tree = eqx.tree_at(
-            lambda t: t.children_discounts,
-            tree,
-            tree.children_discounts.at[next_node_index, action_to_expand].set(
-                step_fn_output.discount
-            ),
+        next_state = SimulationState(
+            node_index=node_index,
+            action=action,
+            next_node_index=next_node_index,
+            depth=state.depth + 1,
+            continue_simulation=continue_simulation,
+            key=subkey,
         )
+        return next_state
 
-        tree = eqx.tree_at(
-            lambda t: t.children_priors,
-            tree,
-            tree.children_priors.at[next_node_index, action_to_expand].set(
-                step_fn_output.priors
-            ),
-        )
-
-        tree = eqx.tree_at(
-            lambda t: t.node_visits,
-            tree,
-            tree.node_visits.at[parent_index].add(1),
-        )
-
-        tree = eqx.tree_at(
-            lambda t: t.children_index,
-            tree,
-            tree.children_index.at[parent_index, action_to_expand].set(next_node_index),
-        )
-
-        tree = eqx.tree_at(
-            lambda t: t.parent_indices,
-            tree,
-            tree.parent_indices.at[next_node_index].set(parent_index),
-        )
-
-        tree = eqx.tree_at(
-            lambda t: t.action_from_parent,
-            tree,
-            tree.action_from_parent.at[next_node_index].set(action_to_expand),
-        )
-
-        return tree, step_fn_output.state_embedding
-
-    def _simulation(
-        self, action_selection_fn: ActionSelectionFn, key: PRNGKeyArray
-    ) -> SimulationState:
-        """
-        Traverse the tree until an unvisited leaf node is reached (or `max_depth`
-        was reached).
-        """
-
-        def body(state: SimulationState) -> SimulationState:
-            key, subkey = jax.random.split(state.key)
-            node_index = state.next_node_index
-            jax_log(
-                "MCTS._simulation.body: Simulation depth {depth}", depth=state.depth
-            )
-            jax_log(
-                "MCTS._simulation.body: Simulation node_index {node_index}",
-                node_index=node_index,
-            )
-
-            action = action_selection_fn(
-                self.tree,
-                current_node_index=node_index,
-                current_depth=state.depth,
-            )
-
-            jax_log("MCTS._simulation.body: Simulation action {action}", action=action)
-
-            next_node_index = self.tree.children_index[state.node_index, action]
-
-            jax_log(
-                "MCTS._simulation.body: Simulation next_node_index {next_node_index}",
-                next_node_index=next_node_index,
-            )
-
-            continue_simulation = jnp.logical_and(
-                state.depth + 1 < self.max_depth, next_node_index != UNVISITED_NODE
-            )
-
-            jax_log(
-                "MCTS._simulation.body: Simulation continue_simulation {continue_simulation}",
-                continue_simulation=continue_simulation,
-            )
-
-            next_state = SimulationState(
-                node_index=node_index,
-                action=action,
-                next_node_index=next_node_index,
-                depth=state.depth + 1,
-                continue_simulation=continue_simulation,
-                key=subkey,
-            )
-            return next_state
-
-        initial_state = SimulationState(
-            node_index=NO_PARENT,
-            action=NO_PARENT,
-            next_node_index=ROOT_NODE,
-            depth=jnp.array(0, dtype=jnp.int32),
-            continue_simulation=jnp.array(True),
-            key=key,
-        )
-        end_state = jax.lax.while_loop(
-            cond_fun=(lambda s: s.continue_simulation),
-            body_fun=body,
-            init_val=initial_state,
-        )
-        return end_state
+    initial_state = SimulationState(
+        node_index=NO_PARENT,
+        action=NO_PARENT,
+        next_node_index=ROOT_NODE,
+        depth=jnp.array(0, dtype=jnp.int32),
+        continue_simulation=jnp.array(True),
+        key=key,
+    )
+    end_state = jax.lax.while_loop(
+        cond_fun=(lambda s: s.continue_simulation),
+        body_fun=body,
+        init_val=initial_state,
+    )
+    return end_state
 
 
 def get_root_fn():
@@ -421,8 +447,6 @@ def get_root_fn():
 
 
 key = jax.random.key(2)
-
-mcts = MCTS(n_simulations=4, n_actions=2, root_fn=get_root_fn())
 
 
 def action_selected_fn(
@@ -478,8 +502,20 @@ def step_function(
     )
 
 
+n_simulations = 5
+n_actions = 2
 step_fn_partial = partial(step_function, RandomWalkEnv())
-final_state = mcts.run(action_selected_fn, step_fn_partial, key)
+final_state = run(
+    action_selection_fn=action_selected_fn,
+    step_fn=step_fn_partial,
+    n_simulations=n_simulations,
+    max_depth=n_simulations,
+    root_fn_output=get_root_fn(),
+    n_actions=n_actions,
+    key=key,
+)
+
+
 # with treescope.active_autovisualizer.set_scoped(treescope.ArrayAutovisualizer()):
 #     contents = treescope.render_to_html(final_state)
 
