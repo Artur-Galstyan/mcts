@@ -1,3 +1,5 @@
+from functools import partial
+
 import numpy as np
 from beartype.typing import NamedTuple
 from typing_extensions import Callable
@@ -6,20 +8,23 @@ from typing_extensions import Callable
 class BanditEnvironment:
     def __init__(self):
         self.tree = {0: [1, 2], 1: [3, 4], 2: [5, 6], 3: [], 4: [], 5: [], 6: []}
-        self.current_state = 0
+        self.current_state = np.array(0)
 
     def reset(self):
-        self.current_state = 0
+        self.current_state = np.array(0)
         return self.current_state
+
+    def set_state(self, state):
+        self.current_state = state
 
     def step(self, action):
         if self.current_state in [3, 4, 5, 6]:
             return self.current_state, 0, True, {}
 
-        if action < 0 or action >= len(self.tree[self.current_state]):
+        if action < 0 or action >= len(self.tree[int(self.current_state)]):
             raise ValueError("Invalid action")
 
-        self.current_state = self.tree[self.current_state][action]
+        self.current_state = self.tree[int(self.current_state)][action]
 
         done = self.current_state in [3, 4, 5, 6]
         reward = 1 if self.current_state == 6 else 0
@@ -45,13 +50,25 @@ def ucb1(avg_node_value, visits_parent, visits_node, exploration_exploitation_fa
     )
 
 
+class SimulationSearchState(NamedTuple):
+    node: int
+    next_node: int
+    action: int
+    depth: int
+    continue_: bool
+
+
 ROOT = 0
 UNVISITED_NODE = -1
 NO_PARENT = -1
 
 
+class RootFnOutput(NamedTuple):
+    root_state: np.ndarray
+
+
 class Tree:
-    def __init__(self, n_actions: int, n_nodes: int):
+    def __init__(self, n_actions: int, n_nodes: int, root_fn_output: RootFnOutput):
         self.n_actions = n_actions
         self.n_nodes = n_nodes
 
@@ -65,22 +82,21 @@ class Tree:
             shape=(self.n_nodes, self.n_actions), fill_value=UNVISITED_NODE
         )
 
+        self.states = {ROOT: root_fn_output.root_state}
+        self.parents = np.full(shape=(self.n_nodes), fill_value=NO_PARENT)
+        self.action_from_parent = np.full(shape=(self.n_nodes), fill_value=NO_PARENT)
 
-def simulate(tree: Tree, max_depth: int, inner_simulation_fn: Callable):
-    class SearchState(NamedTuple):
-        node: int
-        next_node: int
-        action: int
-        depth: int
-        continue_: bool
 
-    def _simulate(state: SearchState):
+def simulate(
+    tree: Tree, max_depth: int, inner_simulation_fn: Callable
+) -> SimulationSearchState:
+    def _simulate(state: SimulationSearchState):
         current_node = state.next_node
         action = inner_simulation_fn(tree, current_node, state.depth)
         next_node = tree.children[current_node, action]
-        should_continue = state.depth + 1 < max_depth and next_node == UNVISITED_NODE
+        should_continue = state.depth + 1 < max_depth and next_node != UNVISITED_NODE
 
-        return SearchState(
+        return SimulationSearchState(
             node=current_node,
             next_node=next_node,
             action=action,
@@ -88,13 +104,101 @@ def simulate(tree: Tree, max_depth: int, inner_simulation_fn: Callable):
             continue_=should_continue,
         )
 
-    state = SearchState(
+    state = SimulationSearchState(
         node=NO_PARENT, next_node=ROOT, action=NO_PARENT, depth=0, continue_=True
     )
 
     while state.continue_:
         state = _simulate(state)
 
+    return state
 
-def expand():
-    pass
+
+class StepFnReturn(NamedTuple):
+    value: float
+    state: np.ndarray
+
+
+def expand(
+    tree: Tree,
+    parent_node: int,
+    action: int,
+    recurrent_step_fn: Callable[[int, np.ndarray], StepFnReturn],
+):
+    if tree.children[parent_node][action] == UNVISITED_NODE:
+        next_node_id = np.max(tree.nodes) + 1
+    else:
+        next_node_id = tree.children[parent_node][action]
+
+    tree.nodes[next_node_id] = next_node_id
+    tree.children[parent_node][action] = next_node_id
+
+    state = tree.states[parent_node]
+
+    value, next_state = recurrent_step_fn(action, state)
+    tree.states[next_node_id] = next_state
+    tree.node_values[next_node_id] = value
+    tree.node_visits[next_node_id] += 1
+
+    tree.parents[next_node_id] = parent_node
+    tree.action_from_parent[next_node_id] = action
+
+    return tree
+
+
+n_actions = 2
+n_simulations = 20
+
+
+tree = Tree(
+    n_actions, n_simulations, RootFnOutput(root_state=BanditEnvironment().reset())
+)
+max_depth = n_simulations
+
+
+def inner_simulation_fn(tree: Tree, node: int, depth: int):
+    children = tree.children[node]
+    parent = node
+
+    best_action = NO_PARENT
+    best_ucb = float("-inf")
+    for action in range(tree.n_actions):
+        child_index = children[action]
+        if child_index == UNVISITED_NODE:
+            return action
+        else:
+            ucb = ucb1(
+                avg_node_value=tree.node_values[child_index],
+                visits_parent=tree.node_visits[parent],
+                visits_node=tree.node_visits[child_index],
+            )
+            if ucb > best_ucb:
+                best_ucb = ucb
+                best_action = action
+    return best_action
+
+
+out = simulate(tree, max_depth, inner_simulation_fn)
+
+print(out)
+
+
+def stepper(action: int, state: np.ndarray, env: BanditEnvironment) -> StepFnReturn:
+    env.set_state(state)
+    next_state, reward, done, _ = env.step(action)
+    value = env.get_future_value(next_state)
+    return StepFnReturn(value=value, state=np.array(next_state))
+
+
+step_fn_partial = partial(stepper, env=BanditEnvironment())
+
+new_tree = expand(tree, out.node, action=out.action, recurrent_step_fn=step_fn_partial)
+
+
+class BackpropagationLoopState(NamedTuple):
+    value: float
+    node_index: int
+
+
+def backpropagate(tree: Tree, leaf_node: int) -> Tree:
+    return tree
