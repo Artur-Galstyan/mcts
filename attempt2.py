@@ -94,6 +94,7 @@ def simulate(
         current_node = state.next_node
         action = inner_simulation_fn(tree, current_node, state.depth)
         next_node = tree.children[current_node, action]
+        print(f"SIMULATION: {current_node=}, {action=}, {next_node=}")
         should_continue = state.depth + 1 < max_depth and next_node != UNVISITED_NODE
 
         return SimulationSearchState(
@@ -142,8 +143,8 @@ def expand(
 
     tree.parents[next_node_id] = parent_node
     tree.action_from_parent[next_node_id] = action
-
-    return tree
+    print(f"EXPAND {next_node_id=}")
+    return tree, next_node_id
 
 
 n_actions = 2
@@ -178,11 +179,6 @@ def inner_simulation_fn(tree: Tree, node: int, depth: int):
     return best_action
 
 
-out = simulate(tree, max_depth, inner_simulation_fn)
-
-print(out)
-
-
 def stepper(action: int, state: np.ndarray, env: BanditEnvironment) -> StepFnReturn:
     env.set_state(state)
     next_state, reward, done, _ = env.step(action)
@@ -192,13 +188,42 @@ def stepper(action: int, state: np.ndarray, env: BanditEnvironment) -> StepFnRet
 
 step_fn_partial = partial(stepper, env=BanditEnvironment())
 
-new_tree = expand(tree, out.node, action=out.action, recurrent_step_fn=step_fn_partial)
-
 
 class BackpropagationLoopState(NamedTuple):
-    value: float
+    # value: float
     node_index: int
 
 
 def backpropagate(tree: Tree, leaf_node: int) -> Tree:
+    def _backpropagate(state: BackpropagationLoopState) -> BackpropagationLoopState:
+        print(f"BACKPROPAGATION {state.node_index}")
+        parent = tree.parents[state.node_index]
+        tree.node_visits[parent] += 1
+        return BackpropagationLoopState(node_index=parent)
+
+    state = BackpropagationLoopState(node_index=leaf_node)
+    while state.node_index != ROOT:
+        state = _backpropagate(state)
+
+    print(f"BACKPROPAGATION {state.node_index}")
+
     return tree
+
+
+tree = Tree(
+    n_actions, n_simulations, RootFnOutput(root_state=BanditEnvironment().reset())
+)
+
+
+def search(tree: Tree, n_iterations: int):
+    for iteration in range(n_iterations):
+        print(f"{iteration=}")
+        out = simulate(tree, max_depth, inner_simulation_fn)
+        tree, leaf_node = expand(
+            tree, out.node, action=out.action, recurrent_step_fn=step_fn_partial
+        )
+
+        tree = backpropagate(tree, leaf_node)
+
+
+search(tree, n_iterations=15)
