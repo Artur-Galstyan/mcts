@@ -6,6 +6,16 @@ from typing_extensions import Callable
 
 
 class BanditEnvironment:
+    """
+        This game tree looks like this:
+
+            0
+           / \\
+           1   2
+          / \\ / \\
+         3   4 5  6
+    """
+
     def __init__(self):
         self.tree = {0: [1, 2], 1: [3, 4], 2: [5, 6], 3: [], 4: [], 5: [], 6: []}
         self.current_state = np.array(0)
@@ -15,6 +25,7 @@ class BanditEnvironment:
         return self.current_state
 
     def set_state(self, state):
+        assert state in [0, 1, 2, 3, 4, 5, 6]
         self.current_state = state
 
     def step(self, action):
@@ -85,16 +96,24 @@ class Tree:
         self.states = {ROOT: root_fn_output.root_state}
         self.parents = np.full(shape=(self.n_nodes), fill_value=NO_PARENT)
         self.action_from_parent = np.full(shape=(self.n_nodes), fill_value=NO_PARENT)
+        self.children_rewards = np.zeros(shape=(self.n_nodes, self.n_actions))
+        self.children_discounts = np.zeros(shape=(self.n_nodes, self.n_actions))
+        self.children_visits = np.zeros(shape=(self.n_nodes, self.n_actions))
+        self.children_values = np.zeros(shape=(self.n_nodes, self.n_actions))
 
 
 def simulate(
     tree: Tree, max_depth: int, inner_simulation_fn: Callable
 ) -> SimulationSearchState:
     def _simulate(state: SimulationSearchState):
-        current_node = state.next_node
+        current_node = int(state.next_node)
         action = inner_simulation_fn(tree, current_node, state.depth)
+        # for debugging
+        children_value = tree.children_values[current_node, action]
         next_node = tree.children[current_node, action]
-        print(f"SIMULATION: {current_node=}, {action=}, {next_node=}")
+        print(
+            f"SIMULATION: {current_node=}, {action=}, {next_node=}, {children_value=}"
+        )
         should_continue = state.depth + 1 < max_depth and next_node != UNVISITED_NODE
 
         return SimulationSearchState(
@@ -117,6 +136,8 @@ def simulate(
 
 class StepFnReturn(NamedTuple):
     value: float
+    discount: float
+    reward: float
     state: np.ndarray
 
 
@@ -136,10 +157,12 @@ def expand(
 
     state = tree.states[parent_node]
 
-    value, next_state = recurrent_step_fn(action, state)
+    value, discount, reward, next_state = recurrent_step_fn(action, state)
     tree.states[next_node_id] = next_state
     tree.node_values[next_node_id] = value
     tree.node_visits[next_node_id] += 1
+    tree.children_rewards[parent_node, action] = reward
+    tree.children_discounts[parent_node, action] = discount
 
     tree.parents[next_node_id] = parent_node
     tree.action_from_parent[next_node_id] = action
@@ -148,13 +171,13 @@ def expand(
 
 
 n_actions = 2
-n_simulations = 20
+n_simulations = 30
 
 
 tree = Tree(
     n_actions, n_simulations, RootFnOutput(root_state=BanditEnvironment().reset())
 )
-max_depth = n_simulations
+max_depth = 2
 
 
 def inner_simulation_fn(tree: Tree, node: int, depth: int):
@@ -181,16 +204,19 @@ def inner_simulation_fn(tree: Tree, node: int, depth: int):
 
 def stepper(action: int, state: np.ndarray, env: BanditEnvironment) -> StepFnReturn:
     env.set_state(state)
+    discount = 0.8
     next_state, reward, done, _ = env.step(action)
     value = env.get_future_value(next_state)
-    return StepFnReturn(value=value, state=np.array(next_state))
+    return StepFnReturn(
+        value=value, state=np.array(next_state), discount=discount, reward=reward
+    )
 
 
 step_fn_partial = partial(stepper, env=BanditEnvironment())
 
 
 class BackpropagationLoopState(NamedTuple):
-    # value: float
+    value: float
     node_index: int
 
 
@@ -198,10 +224,24 @@ def backpropagate(tree: Tree, leaf_node: int) -> Tree:
     def _backpropagate(state: BackpropagationLoopState) -> BackpropagationLoopState:
         print(f"BACKPROPAGATION {state.node_index}")
         parent = tree.parents[state.node_index]
+        parent_visits = tree.node_visits[parent]
+        action = tree.action_from_parent[state.node_index]
+        reward = tree.children_rewards[parent, action]
+        discount = tree.children_discounts[parent, action]
+        leaf_value = reward + discount * state.value
+        parent_value = (tree.node_values[parent] * parent_visits + leaf_value) / (
+            parent_visits + 1.0
+        )
+        tree.node_values[parent] = parent_value
         tree.node_visits[parent] += 1
-        return BackpropagationLoopState(node_index=parent)
+        tree.children_visits[parent, action] += 1
+        tree.children_values[parent, action] = tree.node_values[state.node_index]
 
-    state = BackpropagationLoopState(node_index=leaf_node)
+        return BackpropagationLoopState(node_index=parent, value=float(leaf_value))
+
+    state = BackpropagationLoopState(
+        node_index=leaf_node, value=tree.node_values[leaf_node]
+    )
     while state.node_index != ROOT:
         state = _backpropagate(state)
 
@@ -226,4 +266,4 @@ def search(tree: Tree, n_iterations: int):
         tree = backpropagate(tree, leaf_node)
 
 
-search(tree, n_iterations=15)
+search(tree, n_iterations=30)
