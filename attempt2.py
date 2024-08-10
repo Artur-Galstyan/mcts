@@ -30,7 +30,7 @@ class BanditEnvironment:
 
     def step(self, action):
         if self.current_state in [3, 4, 5, 6]:
-            return self.current_state, 0, True, {}
+            return self.current_state, 0, True
 
         if action < 0 or action >= len(self.tree[int(self.current_state)]):
             raise ValueError("Invalid action")
@@ -40,7 +40,7 @@ class BanditEnvironment:
         done = self.current_state in [3, 4, 5, 6]
         reward = 1 if self.current_state == 6 else 0
 
-        return self.current_state, reward, done, {}
+        return self.current_state, reward, done
 
     def render(self):
         print(f"Current state: {self.current_state}")
@@ -205,7 +205,7 @@ def inner_simulation_fn(tree: Tree, node: int, depth: int):
 def stepper(action: int, state: np.ndarray, env: BanditEnvironment) -> StepFnReturn:
     env.set_state(state)
     discount = 0.8
-    next_state, reward, done, _ = env.step(action)
+    next_state, reward, done = env.step(action)
     value = env.get_future_value(next_state)
     return StepFnReturn(
         value=value, state=np.array(next_state), discount=discount, reward=reward
@@ -266,4 +266,9 @@ def search(tree: Tree, n_iterations: int):
         tree = backpropagate(tree, leaf_node)
 
 
-search(tree, n_iterations=30)
+def main():
+    search(tree, n_iterations=30)
+
+
+if __name__ == "__main__":
+    main()
