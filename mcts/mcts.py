@@ -251,10 +251,8 @@ def selection(
         proceed=np.array(True),
     )
 
-    # print(state)
     while state.proceed:
         state = _selection(state)
-        # print(state)
 
     return SelectionOutput(state.node_index, state.action)
 
