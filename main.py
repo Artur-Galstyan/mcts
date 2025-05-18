@@ -6,7 +6,7 @@ import gymnasium as gym
 import numpy as np
 from beartype.typing import Any, Callable, NamedTuple
 from jaxtyping import Bool, Float, Int, PyTree
-from mcts import (
+from mctsnp import (
     MCTS,
     ActionSelectionInput,
     ActionSelectionReturn,
