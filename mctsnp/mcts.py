@@ -17,16 +17,13 @@ class Tree:
     children_indices: Int[np.ndarray, "n_nodes n_actions"]
     action_from_parent: Int[np.ndarray, "n_nodes"]
 
-    raw_values: Float[np.ndarray, "n_nodes"]
-
     node_visits: Int[np.ndarray, "n_nodes"]
     node_values: Float[np.ndarray, "n_nodes"]
+    node_is_terminal: Bool[np.ndarray, "n_nodes"]
 
     children_values: Float[np.ndarray, "n_nodes n_actions"]
     children_visits: Int[np.ndarray, "n_nodes n_actions"]
     children_rewards: Float[np.ndarray, "n_nodes n_actions"]
-    children_discounts: Float[np.ndarray, "n_nodes n_actions"]
-    children_prior_logits: Float[np.ndarray, "n_nodes n_actions"]
 
     embeddings: dict
 
@@ -160,8 +157,8 @@ class StepFnInput(NamedTuple):
 
 class StepFnReturn(NamedTuple):
     value: Float[np.ndarray, ""]
-    discount: Float[np.ndarray, ""]
     reward: Float[np.ndarray, ""]
+    done: Bool[np.ndarray, ""]
     embedding: Any
 
 
@@ -189,31 +186,27 @@ def generate_tree(n_nodes: int, n_actions: int, root_fn_output: RootFnOutput) ->
     action_from_parent = np.full(shape=(n_nodes), fill_value=NO_PARENT)
     children_indices = np.full(shape=(n_nodes, n_actions), fill_value=UNVISITED)
 
-    raw_values = np.zeros(shape=(n_nodes))
-
     node_visits = np.zeros(shape=(n_nodes), dtype=np.int32)
     node_values = np.zeros(shape=(n_nodes))
 
     children_values = np.zeros(shape=(n_nodes, n_actions))
     children_visits = np.zeros(shape=(n_nodes, n_actions), dtype=np.int32)
     children_rewards = np.zeros(shape=(n_nodes, n_actions))
-    children_discounts = np.zeros(shape=(n_nodes, n_actions))
-    children_prior_logits = np.zeros(shape=(n_nodes, n_actions))
+    node_is_terminal = np.zeros(shape=(n_nodes), dtype=bool)
 
     embeddings = {ROOT_INDEX: root_fn_output.embedding}
+    node_visits[ROOT_INDEX] = 1
 
     return Tree(
         parent_indices=parent_indices,
         children_indices=children_indices,
         action_from_parent=action_from_parent,
-        raw_values=raw_values,
         node_visits=node_visits,
         node_values=node_values,
+        node_is_terminal=node_is_terminal,
         children_values=children_values,
         children_visits=children_visits,
         children_rewards=children_rewards,
-        children_discounts=children_discounts,
-        children_prior_logits=children_prior_logits,
         embeddings=embeddings,
     )
 
@@ -225,6 +218,15 @@ def selection(
 ) -> SelectionOutput:
     def _selection(state: SelectionState) -> SelectionState:
         node_index = state.next_node_index
+        if tree.node_is_terminal[node_index]:
+            return SelectionState(
+                node_index=state.node_index,
+                next_node_index=node_index,
+                depth=state.depth,
+                action=state.action,
+                proceed=np.array(False),
+            )
+
         action_selection_output = inner_action_selection_fn(
             ActionSelectionInput(tree, node_index, state.depth)
         )
@@ -232,8 +234,8 @@ def selection(
             node_index, action_selection_output.action
         ]
         visited = next_node_index != np.array(UNVISITED)
-        max_depth_exceeded = state.depth + 1 < max_depth
-        proceed = np.logical_and(visited, max_depth_exceeded)
+        max_depth_not_exceeded = state.depth + 1 < max_depth
+        proceed = np.logical_and(visited, max_depth_not_exceeded)
 
         return SelectionState(
             node_index,
@@ -268,7 +270,7 @@ def expansion(
         f"Can only expand unvisited nodes, got {tree.children_indices[parent_index, action]=}"
     )
     embedding = tree.embeddings[parent_index]
-    value, discount, reward, next_state = step_fn(
+    value, reward, done, next_state = step_fn(
         StepFnInput(embedding=embedding, action=action)
     )
     tree.children_indices[parent_index, action] = next_node_index
@@ -276,7 +278,7 @@ def expansion(
     tree.parent_indices[next_node_index] = parent_index
     tree.node_values[next_node_index] = value
     tree.node_visits[next_node_index] = 1
-    tree.children_discounts[parent_index, action] = discount
+    tree.node_is_terminal[next_node_index] = done
     tree.children_rewards[parent_index, action] = reward
     tree.embeddings[next_node_index] = next_state
 
@@ -293,12 +295,11 @@ def backpropagate(tree: Tree, leaf_index: int) -> Tree:
         action = tree.action_from_parent[idx]
 
         reward = tree.children_rewards[parent, action]
-        discount = tree.children_discounts[parent, action]
 
         parent_value = tree.node_values[parent]
         parent_visits = tree.node_visits[parent]
 
-        leaf_value = reward + discount * state.value
+        leaf_value = reward + state.value
         parent_value = (parent_value * parent_visits + leaf_value) / (
             parent_visits + 1.0
         )
