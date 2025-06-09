@@ -52,7 +52,7 @@ def step_fn(input: StepFnInput, env: gym.Env) -> StepFnReturn:
     next_obs, reward, terminated, truncated, _ = env_copy.step(int(input.action))
 
     # I WILL NOT WRITE COMMENTS. THERE WILL BE NO COMMENTS IN MY CODE.
-    if terminated and reward > 0:
+    if terminated and reward > 0:  # pyright: ignore
         value = 1.0  # Goal reached!
     elif terminated and reward == 0:
         value = -1.0  # Fell in hole - BAD!
@@ -162,7 +162,7 @@ tree = MCTS.search(
     n_iterations=5000,  # Even more iterations to find the goal
 )
 
-print(f"Tree statistics:")
+print("Tree statistics:")
 print(f"  Total nodes: {len(tree.embeddings)}")
 print(f"  Root visits: {tree.node_visits[ROOT_INDEX]}")
 print(f"  Root value: {tree.node_values[ROOT_INDEX]:.3f}")
@@ -188,7 +188,7 @@ if best_path:
         print(f"\nStep {i + 1}: Action {['Left', 'Down', 'Right', 'Up'][action]}")
         obs, reward, terminated, truncated, _ = env.step(action)
         state = obs
-        total_reward += reward
+        total_reward += reward  # pyright: ignore
         print(env.render())
         print(f"Player at state {state} (row {state // 4}, col {state % 4})")
         print(f"Reward: {reward}")
