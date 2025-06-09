@@ -156,13 +156,23 @@ class StepFnInput(NamedTuple):
 
 
 class StepFnReturn(NamedTuple):
+    """
+    Return type for the step function that processes a state and action.
+
+    Attributes:
+        value: Estimated value from this state (via rollout/NN/heuristic)
+        reward: Immediate reward for taking action
+        done: Boolean indicating whether this is a terminal state
+        embedding: Next state representation after taking the action
+    """
+
     value: Float[np.ndarray, ""]
     reward: Float[np.ndarray, ""]
     done: Bool[np.ndarray, ""]
     embedding: Any
 
 
-class ExpansionOutput(NamedTuple):
+class LeafNode(NamedTuple):
     node_index: int
     action: Int[np.ndarray, ""]
 
@@ -264,7 +274,7 @@ def expansion(
     selection_output: SelectionOutput,
     next_node_index: int,
     step_fn: Callable[[StepFnInput], StepFnReturn],
-) -> ExpansionOutput:
+) -> LeafNode:
     parent_index, action = selection_output
     assert tree.children_indices[parent_index, action] == UNVISITED, (
         f"Can only expand unvisited nodes, got {tree.children_indices[parent_index, action]=}"
@@ -282,7 +292,7 @@ def expansion(
     tree.children_rewards[parent_index, action] = reward
     tree.embeddings[next_node_index] = next_state
 
-    return ExpansionOutput(
+    return LeafNode(
         node_index=next_node_index,
         action=action,
     )
@@ -351,18 +361,18 @@ class MCTS:
                 == UNVISITED
             ):
                 node_index_counter += 1
-                expansion_output = expansion(
+                leaf_node = expansion(
                     tree, selection_output, node_index_counter, step_fn
                 )
             else:
                 child_idx = tree.children_indices[
                     selection_output.parent_index, selection_output.action
                 ]
-                expansion_output = ExpansionOutput(
+                leaf_node = LeafNode(
                     node_index=child_idx,
                     action=selection_output.action,
                 )
 
-            tree = backpropagate(tree, expansion_output.node_index)
+            tree = backpropagate(tree, leaf_node.node_index)
 
         return tree
