@@ -13,6 +13,7 @@ from mctsnp import (
     StepFnInput,
     StepFnReturn,
 )
+from mctsnp.mcts import Tree
 
 
 def root_fn(initial_obs: int) -> RootFnOutput:
@@ -67,7 +68,7 @@ def step_fn(input: StepFnInput, env: gym.Env) -> StepFnReturn:
     )
 
 
-def get_best_path_no_cycles(tree):
+def get_best_path_no_cycles(tree: Tree):
     path = []
     node = ROOT_INDEX
     visited_states = {tree.embeddings[ROOT_INDEX]}

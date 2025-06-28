@@ -25,7 +25,7 @@ class Tree:
     children_visits: Int[np.ndarray, "n_nodes n_actions"]
     children_rewards: Float[np.ndarray, "n_nodes n_actions"]
 
-    embeddings: dict
+    embeddings: dict[Int, Any]
 
     def __str__(self):
         """
