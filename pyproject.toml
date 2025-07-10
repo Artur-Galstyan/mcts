@@ -1,5 +1,5 @@
 [project]
-name = "mctsnp"
+name = "unimcts"
 version = "0.1.1"
 description = "Monte Carlo Tree Search with Numpy"
 readme = "README.md"
