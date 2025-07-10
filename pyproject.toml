@@ -1,7 +1,7 @@
 [project]
-name = "mctsnp"
+name = "unimcts"
 version = "0.1.1"
-description = "Monte Carlo Tree Search with Numpy"
+description = "Monte Carlo Tree Search with Numpy, TensorFlow, JAX and PyTorch"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -14,7 +14,3 @@ dependencies = [
 dev = [
     "pytest>=8.3.5",
 ]
-
-[build-system]
-requires = ["hatchling>=1.26.1"]
-build-backend = "hatchling.build"

@@ -1,71 +1,54 @@
 import copy
 import functools
+import time
 
 import gymnasium as gym
 import numpy as np
-from mctsnp import (
+from unimcts.numpy import (
     MCTS,
     ROOT_INDEX,
     UNVISITED,
-    ActionSelectionInput,
-    ActionSelectionReturn,
+    BatchedStepFnInput,
+    BatchedStepFnReturn,
     RootFnOutput,
-    StepFnInput,
     StepFnReturn,
+    Tree,
 )
-from mctsnp.mcts import Tree
+from unimcts.numpy.strategies import ucb_action_selection
 
 
 def root_fn(initial_obs: int) -> RootFnOutput:
     return RootFnOutput(embedding=int(initial_obs))
 
 
-def ucb_action_selection(input: ActionSelectionInput) -> ActionSelectionReturn:
-    # I WILL NOT WRITE COMMENTS. THERE WILL BE NO COMMENTS IN MY CODE.
-    tree = input.tree
-    node = input.node_index
+def batched_step_fn(input: BatchedStepFnInput, env: gym.Env) -> BatchedStepFnReturn:
+    returns = []
 
-    visits = tree.children_visits[node]
-    indices = tree.children_indices[node]
+    for i in range(len(input.actions)):
+        env_copy = copy.deepcopy(env)
+        env_copy.unwrapped.s = input.embeddings[i]
 
-    unvisited = np.where(indices == UNVISITED)[0]
+        next_obs, reward, terminated, truncated, _ = env_copy.step(
+            int(input.actions[i, 0])
+        )
 
-    if len(unvisited) > 0:
-        action = np.random.choice(unvisited)
-        return ActionSelectionReturn(action=np.array(action))
+        if terminated and reward > 0:  # pyright: ignore
+            value = 1.0
+        elif terminated and reward == 0:
+            value = -1.0
+        else:
+            value = 0.0
 
-    values = tree.children_values[node]
-    total_visits = tree.node_visits[node]
+        returns.append(
+            StepFnReturn(
+                value=np.array(value),
+                reward=np.array(float(reward)),
+                embedding=int(next_obs),
+                done=np.array(terminated or truncated),
+            )
+        )
 
-    exploration_term = 2.0 * np.sqrt(
-        np.log(total_visits) / visits
-    )  # Increased from 1.414 to 2.0
-    ucb = values + exploration_term
-
-    action = np.argmax(ucb)
-    return ActionSelectionReturn(action=np.array(action))
-
-
-def step_fn(input: StepFnInput, env: gym.Env) -> StepFnReturn:
-    env_copy = copy.deepcopy(env)
-    env_copy.unwrapped.s = input.embedding
-
-    next_obs, reward, terminated, truncated, _ = env_copy.step(int(input.action))
-
-    # I WILL NOT WRITE COMMENTS. THERE WILL BE NO COMMENTS IN MY CODE.
-    if terminated and reward > 0:  # pyright: ignore
-        value = 1.0  # Goal reached!
-    elif terminated and reward == 0:
-        value = -1.0  # Fell in hole - BAD!
-    else:
-        value = 0.0  # Still exploring
-
-    return StepFnReturn(
-        value=np.array(value),
-        reward=np.array(float(reward)),
-        embedding=int(next_obs),
-        done=np.array(terminated or truncated),
-    )
+    return BatchedStepFnReturn(returns=returns)
 
 
 def get_best_path_no_cycles(tree: Tree):
@@ -154,22 +137,23 @@ print("Goal: Find path from S to G avoiding holes (H)")
 print(f"Initial state: {obs}\n")
 
 # Run MCTS with more iterations
+start = time.time()
 tree = MCTS.search(
     n_actions=env.action_space.n,
     max_depth=20,
     root_fn=functools.partial(root_fn, initial_obs=obs),
     inner_action_selection_fn=ucb_action_selection,
-    step_fn=functools.partial(step_fn, env=env),
-    n_iterations=5000,  # Even more iterations to find the goal
+    batched_step_fn=functools.partial(batched_step_fn, env=env),
+    n_iterations=10000,
+    batch_size=8,  # Add batch size for efficiency
 )
+end = time.time()
+print(f"Search duration = {end - start}")
 
 print("Tree statistics:")
 print(f"  Total nodes: {len(tree.embeddings)}")
 print(f"  Root visits: {tree.node_visits[ROOT_INDEX]}")
 print(f"  Root value: {tree.node_values[ROOT_INDEX]:.3f}")
-
-print("\nTree structure from root:")
-debug_node(tree, ROOT_INDEX)
 
 # Get and test best path
 best_path = get_best_path_no_cycles(tree)

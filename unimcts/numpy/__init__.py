@@ -4,8 +4,11 @@ from .mcts import (
     UNVISITED,
     ActionSelectionInput,
     ActionSelectionReturn,
+    BatchedStepFnInput,
+    BatchedStepFnReturn,
     RootFnOutput,
     StepFnInput,
     StepFnReturn,
+    Tree,
     generate_tree,
 )

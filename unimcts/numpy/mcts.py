@@ -1,10 +1,9 @@
-import copy
-import functools
 from dataclasses import dataclass
 
-import numpy as np
 from beartype.typing import Any, Callable, NamedTuple
-from jaxtyping import Bool, Float, Int, PyTree
+from jaxtyping import Bool, Float, Int
+
+import numpy as np
 
 NO_PARENT = -1
 UNVISITED = -1
@@ -26,109 +25,6 @@ class Tree:
     children_rewards: Float[np.ndarray, "n_nodes n_actions"]
 
     embeddings: dict[Int, Any]
-
-    def __str__(self):
-        """
-        Returns a formatted string representation of the tree.
-        This provides a more readable view than the default __repr__.
-        """
-        # Format tree statistics
-        stats = []
-        stats.append("Tree Statistics:")
-
-        # Count visited nodes
-        visited_nodes = sum(self.node_visits > 0)
-        stats.append(f"  Visited nodes: {visited_nodes}/{len(self.node_visits)}")
-
-        # Add root info if it has been visited
-        if self.node_visits[ROOT_INDEX] > 0:
-            stats.append(f"  Root visits: {self.node_visits[ROOT_INDEX]}")
-            stats.append(f"  Root value: {self.node_values[ROOT_INDEX]:.4f}")
-
-        # Count expanded children
-        expanded_children = sum(np.any(self.children_indices != UNVISITED, axis=1))
-        stats.append(f"  Nodes with children: {expanded_children}")
-
-        # Format compact tree structure
-        structure = []
-        structure.append("Tree Structure:")
-
-        def _format_node(node_idx, depth=0, max_depth=2):
-            if depth > max_depth:
-                return []
-
-            indent = "  " * depth
-            node_lines = []
-
-            # Skip unvisited nodes
-            if self.node_visits[node_idx] == 0 and node_idx != ROOT_INDEX:
-                return node_lines
-
-            # Format node info
-            node_text = f"{indent}Node {node_idx}"
-            if node_idx == ROOT_INDEX:
-                node_text += " (ROOT)"
-            else:
-                action = self.action_from_parent[node_idx]
-                node_text += f" (via action {action})"
-
-            visits = self.node_visits[node_idx]
-            value = self.node_values[node_idx]
-            node_text += f", Visits: {visits}, Value: {value:.4f}"
-
-            node_lines.append(node_text)
-
-            # Add children (if any and if we haven't reached max depth)
-            if depth < max_depth:
-                children = [
-                    (a, child_idx)
-                    for a, child_idx in enumerate(self.children_indices[node_idx])
-                    if child_idx != UNVISITED
-                ]
-
-                for action, child_idx in children:
-                    child_visits = self.children_visits[node_idx, action]
-                    # Skip unvisited children
-                    if child_visits == 0:
-                        continue
-
-                    child_value = self.children_values[node_idx, action]
-                    child_text = f"{indent}  └── Action {action}: → Node {child_idx}, Visits: {child_visits}, Value: {child_value:.4f}"
-                    node_lines.append(child_text)
-
-                    # Recursively add the child's children
-                    child_lines = _format_node(child_idx, depth + 2, max_depth)
-                    node_lines.extend(child_lines)
-
-            return node_lines
-
-        structure.extend(_format_node(ROOT_INDEX))
-        return "\n".join(stats + [""] + structure)
-
-    def __repr__(self):
-        lines = ["Tree("]
-        parent_shape = self.parent_indices.shape
-        children_shape = self.children_indices.shape
-
-        non_default_parents = np.sum(self.parent_indices != NO_PARENT)
-        non_default_children = np.sum(self.children_indices != UNVISITED)
-        non_zero_visits = np.sum(self.node_visits > 0)
-
-        lines.append(
-            f"  parent_indices: shape={parent_shape}, non_default={non_default_parents},"
-        )
-        lines.append(
-            f"  children_indices: shape={children_shape}, non_default={non_default_children},"
-        )
-        lines.append(
-            f"  node_visits: shape={self.node_visits.shape}, non_zero={non_zero_visits},"
-        )
-
-        lines.append(
-            f"  embeddings: {{{', '.join(f'{k}' for k in self.embeddings.keys())}}})"
-        )
-
-        return "\n".join(lines)
 
 
 class RootFnOutput(NamedTuple):
@@ -170,6 +66,15 @@ class StepFnReturn(NamedTuple):
     reward: Float[np.ndarray, ""]
     done: Bool[np.ndarray, ""]
     embedding: Any
+
+
+class BatchedStepFnInput(NamedTuple):
+    embeddings: list[Any]
+    actions: Int[np.ndarray, "batch_size 1"]
+
+
+class BatchedStepFnReturn(NamedTuple):
+    returns: list[StepFnReturn]
 
 
 class LeafNode(NamedTuple):
@@ -273,16 +178,14 @@ def expansion(
     tree: Tree,
     selection_output: SelectionOutput,
     next_node_index: int,
-    step_fn: Callable[[StepFnInput], StepFnReturn],
+    step_fn_return: StepFnReturn,
 ) -> LeafNode:
     parent_index, action = selection_output
     assert tree.children_indices[parent_index, action] == UNVISITED, (
         f"Can only expand unvisited nodes, got {tree.children_indices[parent_index, action]=}"
     )
-    embedding = tree.embeddings[parent_index]
-    value, reward, done, next_state = step_fn(
-        StepFnInput(embedding=embedding, action=action)
-    )
+    value, reward, done, next_state = step_fn_return
+
     tree.children_indices[parent_index, action] = next_node_index
     tree.action_from_parent[next_node_index] = action
     tree.parent_indices[next_node_index] = parent_index
@@ -342,37 +245,91 @@ class MCTS:
         inner_action_selection_fn: Callable[
             [ActionSelectionInput], ActionSelectionReturn
         ],
-        step_fn: Callable[[StepFnInput], StepFnReturn],
+        batched_step_fn: Callable[[BatchedStepFnInput], BatchedStepFnReturn],
         max_depth: int,
         n_iterations: int,
+        batch_size: int = 1,
     ):
         node_index_counter = 0
         tree = generate_tree(
             n_nodes=n_iterations + 1, n_actions=n_actions, root_fn_output=root_fn()
         )
 
-        for iteration in range(n_iterations):
-            selection_output = selection(tree, max_depth, inner_action_selection_fn)
+        total_iterations_done = 0
+        while total_iterations_done < n_iterations:
+            dedupes = set()
+            pending_expansions: list[tuple[SelectionOutput, int]] = []
+            leaf_nodes: list[LeafNode] = []
 
-            if (
-                tree.children_indices[
-                    selection_output.parent_index, selection_output.action
-                ]
-                == UNVISITED
+            attempts = 0
+            while (
+                len(pending_expansions) + len(leaf_nodes) < batch_size
+                and attempts < batch_size * 3
+                and total_iterations_done + len(pending_expansions) + len(leaf_nodes)
+                < n_iterations
             ):
-                node_index_counter += 1
-                leaf_node = expansion(
-                    tree, selection_output, node_index_counter, step_fn
-                )
-            else:
-                child_idx = tree.children_indices[
-                    selection_output.parent_index, selection_output.action
-                ]
-                leaf_node = LeafNode(
-                    node_index=child_idx,
-                    action=selection_output.action,
+                attempts += 1
+                selection_output = selection(tree, max_depth, inner_action_selection_fn)
+
+                if (
+                    selection_output.parent_index,
+                    int(selection_output.action),
+                ) in dedupes:
+                    continue
+                elif (
+                    tree.children_indices[
+                        selection_output.parent_index, selection_output.action
+                    ]
+                    == UNVISITED
+                ):
+                    node_index_counter += 1
+                    pending_expansions.append((selection_output, node_index_counter))
+                    dedupes.add(
+                        (
+                            selection_output.parent_index,
+                            int(selection_output.action),
+                        )
+                    )
+                else:
+                    child_idx = tree.children_indices[
+                        selection_output.parent_index, selection_output.action
+                    ]
+                    leaf_nodes.append(
+                        LeafNode(node_index=child_idx, action=selection_output.action)
+                    )
+
+            if len(pending_expansions) > 0:
+                actions = np.zeros(shape=(len(pending_expansions), 1))
+                embeddings = []
+
+                for i, p in enumerate(pending_expansions):
+                    selection_output, _ = p
+                    action = selection_output.action
+                    embedding = tree.embeddings[selection_output.parent_index]
+                    actions[i] = action
+                    embeddings.append(embedding)
+
+                batched_step_fn_return = batched_step_fn(
+                    BatchedStepFnInput(
+                        actions=actions,
+                        embeddings=embeddings,
+                    )
                 )
 
-            tree = backpropagate(tree, leaf_node.node_index)
+                for b, p in zip(batched_step_fn_return.returns, pending_expansions):
+                    selection_output, next_node_index = p
+                    leaf_nodes.append(
+                        expansion(
+                            tree=tree,
+                            selection_output=selection_output,
+                            next_node_index=next_node_index,
+                            step_fn_return=b,
+                        )
+                    )
+
+            for leaf_node in leaf_nodes:
+                tree = backpropagate(tree, leaf_node.node_index)
+
+            total_iterations_done += len(leaf_nodes)
 
         return tree
