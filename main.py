@@ -3,7 +3,7 @@ import functools
 
 import gymnasium as gym
 import numpy as np
-from mctsnp import (
+from unimcts import (
     MCTS,
     ROOT_INDEX,
     UNVISITED,
@@ -13,7 +13,7 @@ from mctsnp import (
     StepFnInput,
     StepFnReturn,
 )
-from mctsnp.mcts import Tree
+from unimcts.mcts import Tree
 
 
 def root_fn(initial_obs: int) -> RootFnOutput:
