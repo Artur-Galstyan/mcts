@@ -480,14 +480,25 @@ if __name__ == "__main__":
     print("Goal: Find path from S to G avoiding holes (H)")
     print(f"Initial state: {obs}\n")
 
+    start_time = time.time()
+
+    n_iterations = 50_000
+    n_workers = 1
+
     tree = MCTS.search(
         n_actions=env.action_space.n,
         max_depth=20,
-        n_iterations=50000,
-        n_workers=16,
+        n_iterations=n_iterations,
+        n_workers=n_workers,
         root_fn=functools.partial(root_fn, initial_obs=obs),
         inner_action_selection_fn=ucb_action_selection,
         step_fn=batched_step_fn,
+    )
+
+    end_time = time.time()
+
+    print(
+        f"Search duration was {end_time - start_time:.3f} seconds, i.e. each iteration took {(end_time - start_time) / n_iterations * 1000:.3f} ms ({n_workers} workers)"
     )
 
     print("Tree statistics:")
@@ -495,8 +506,8 @@ if __name__ == "__main__":
     print(f"  Root visits: {tree.node_visits[ROOT_INDEX]}")
     print(f"  Root value: {tree.node_values[ROOT_INDEX]:.3f}")
 
-    print("\nTree structure from root:")
-    debug_node(tree, ROOT_INDEX)
+    # print("\nTree structure from root:")
+    # debug_node(tree, ROOT_INDEX)
 
     best_path = get_best_path_no_cycles(tree)
     print(f"\nBest path found (avoiding cycles): {best_path}")
@@ -510,13 +521,13 @@ if __name__ == "__main__":
         total_reward = 0
         state = 0
         for i, action in enumerate(best_path):
-            print(f"\nStep {i + 1}: Action {['Left', 'Down', 'Right', 'Up'][action]}")
+            # print(f"\nStep {i + 1}: Action {['Left', 'Down', 'Right', 'Up'][action]}")
             obs, reward, terminated, truncated, _ = env.step(action)
             state = obs
             total_reward += reward
-            print(env.render())
-            print(f"Player at state {state} (row {state // 4}, col {state % 4})")
-            print(f"Reward: {reward}")
+            # print(env.render())
+            # print(f"Player at state {state} (row {state // 4}, col {state % 4})")
+            # print(f"Reward: {reward}")
             if terminated or truncated:
                 if reward == 0:
                     print("💀 Fell in a hole!")
