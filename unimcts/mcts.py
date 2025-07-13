@@ -1,10 +1,13 @@
-import copy
-import functools
+import multiprocessing
+import multiprocessing.pool
+import queue
+import time
 from dataclasses import dataclass
 
+import gymnasium as gym
 import numpy as np
 from beartype.typing import Any, Callable, NamedTuple
-from jaxtyping import Bool, Float, Int, PyTree
+from jaxtyping import Bool, Float, Int
 
 NO_PARENT = -1
 UNVISITED = -1
@@ -16,119 +19,14 @@ class Tree:
     parent_indices: Int[np.ndarray, "n_nodes"]
     children_indices: Int[np.ndarray, "n_nodes n_actions"]
     action_from_parent: Int[np.ndarray, "n_nodes"]
-
     node_visits: Int[np.ndarray, "n_nodes"]
     node_values: Float[np.ndarray, "n_nodes"]
     node_is_terminal: Bool[np.ndarray, "n_nodes"]
-
+    virtual_losses: Int[np.ndarray, "n_nodes"]
     children_values: Float[np.ndarray, "n_nodes n_actions"]
     children_visits: Int[np.ndarray, "n_nodes n_actions"]
     children_rewards: Float[np.ndarray, "n_nodes n_actions"]
-
     embeddings: dict[Int, Any]
-
-    def __str__(self):
-        """
-        Returns a formatted string representation of the tree.
-        This provides a more readable view than the default __repr__.
-        """
-        # Format tree statistics
-        stats = []
-        stats.append("Tree Statistics:")
-
-        # Count visited nodes
-        visited_nodes = sum(self.node_visits > 0)
-        stats.append(f"  Visited nodes: {visited_nodes}/{len(self.node_visits)}")
-
-        # Add root info if it has been visited
-        if self.node_visits[ROOT_INDEX] > 0:
-            stats.append(f"  Root visits: {self.node_visits[ROOT_INDEX]}")
-            stats.append(f"  Root value: {self.node_values[ROOT_INDEX]:.4f}")
-
-        # Count expanded children
-        expanded_children = sum(np.any(self.children_indices != UNVISITED, axis=1))
-        stats.append(f"  Nodes with children: {expanded_children}")
-
-        # Format compact tree structure
-        structure = []
-        structure.append("Tree Structure:")
-
-        def _format_node(node_idx, depth=0, max_depth=2):
-            if depth > max_depth:
-                return []
-
-            indent = "  " * depth
-            node_lines = []
-
-            # Skip unvisited nodes
-            if self.node_visits[node_idx] == 0 and node_idx != ROOT_INDEX:
-                return node_lines
-
-            # Format node info
-            node_text = f"{indent}Node {node_idx}"
-            if node_idx == ROOT_INDEX:
-                node_text += " (ROOT)"
-            else:
-                action = self.action_from_parent[node_idx]
-                node_text += f" (via action {action})"
-
-            visits = self.node_visits[node_idx]
-            value = self.node_values[node_idx]
-            node_text += f", Visits: {visits}, Value: {value:.4f}"
-
-            node_lines.append(node_text)
-
-            # Add children (if any and if we haven't reached max depth)
-            if depth < max_depth:
-                children = [
-                    (a, child_idx)
-                    for a, child_idx in enumerate(self.children_indices[node_idx])
-                    if child_idx != UNVISITED
-                ]
-
-                for action, child_idx in children:
-                    child_visits = self.children_visits[node_idx, action]
-                    # Skip unvisited children
-                    if child_visits == 0:
-                        continue
-
-                    child_value = self.children_values[node_idx, action]
-                    child_text = f"{indent}  └── Action {action}: → Node {child_idx}, Visits: {child_visits}, Value: {child_value:.4f}"
-                    node_lines.append(child_text)
-
-                    # Recursively add the child's children
-                    child_lines = _format_node(child_idx, depth + 2, max_depth)
-                    node_lines.extend(child_lines)
-
-            return node_lines
-
-        structure.extend(_format_node(ROOT_INDEX))
-        return "\n".join(stats + [""] + structure)
-
-    def __repr__(self):
-        lines = ["Tree("]
-        parent_shape = self.parent_indices.shape
-        children_shape = self.children_indices.shape
-
-        non_default_parents = np.sum(self.parent_indices != NO_PARENT)
-        non_default_children = np.sum(self.children_indices != UNVISITED)
-        non_zero_visits = np.sum(self.node_visits > 0)
-
-        lines.append(
-            f"  parent_indices: shape={parent_shape}, non_default={non_default_parents},"
-        )
-        lines.append(
-            f"  children_indices: shape={children_shape}, non_default={non_default_children},"
-        )
-        lines.append(
-            f"  node_visits: shape={self.node_visits.shape}, non_zero={non_zero_visits},"
-        )
-
-        lines.append(
-            f"  embeddings: {{{', '.join(f'{k}' for k in self.embeddings.keys())}}})"
-        )
-
-        return "\n".join(lines)
 
 
 class RootFnOutput(NamedTuple):
@@ -155,21 +53,23 @@ class StepFnInput(NamedTuple):
     action: Int[np.ndarray, ""]
 
 
+class BatchedStepFnInput(NamedTuple):
+    embeddings: list[Any]
+    actions: Int[np.ndarray, "batch_size"]
+
+
 class StepFnReturn(NamedTuple):
-    """
-    Return type for the step function that processes a state and action.
-
-    Attributes:
-        value: Estimated value from this state (via rollout/NN/heuristic)
-        reward: Immediate reward for taking action
-        done: Boolean indicating whether this is a terminal state
-        embedding: Next state representation after taking the action
-    """
-
     value: Float[np.ndarray, ""]
     reward: Float[np.ndarray, ""]
     done: Bool[np.ndarray, ""]
     embedding: Any
+
+
+class BatchedStepFnReturn(NamedTuple):
+    value: Float[np.ndarray, "batch_size"]
+    reward: Float[np.ndarray, "batch_size"]
+    done: Bool[np.ndarray, "batch_size"]
+    embedding: list[Any]
 
 
 class LeafNode(NamedTuple):
@@ -195,18 +95,15 @@ def generate_tree(n_nodes: int, n_actions: int, root_fn_output: RootFnOutput) ->
     parent_indices = np.full(shape=(n_nodes), fill_value=NO_PARENT)
     action_from_parent = np.full(shape=(n_nodes), fill_value=NO_PARENT)
     children_indices = np.full(shape=(n_nodes, n_actions), fill_value=UNVISITED)
-
     node_visits = np.zeros(shape=(n_nodes), dtype=np.int32)
     node_values = np.zeros(shape=(n_nodes))
-
     children_values = np.zeros(shape=(n_nodes, n_actions))
     children_visits = np.zeros(shape=(n_nodes, n_actions), dtype=np.int32)
     children_rewards = np.zeros(shape=(n_nodes, n_actions))
     node_is_terminal = np.zeros(shape=(n_nodes), dtype=bool)
-
+    virtual_losses = np.zeros(shape=(n_nodes), dtype=np.int32)
     embeddings = {ROOT_INDEX: root_fn_output.embedding}
     node_visits[ROOT_INDEX] = 1
-
     return Tree(
         parent_indices=parent_indices,
         children_indices=children_indices,
@@ -217,6 +114,7 @@ def generate_tree(n_nodes: int, n_actions: int, root_fn_output: RootFnOutput) ->
         children_values=children_values,
         children_visits=children_visits,
         children_rewards=children_rewards,
+        virtual_losses=virtual_losses,
         embeddings=embeddings,
     )
 
@@ -236,7 +134,6 @@ def selection(
                 action=state.action,
                 proceed=np.array(False),
             )
-
         action_selection_output = inner_action_selection_fn(
             ActionSelectionInput(tree, node_index, state.depth)
         )
@@ -246,7 +143,6 @@ def selection(
         visited = next_node_index != np.array(UNVISITED)
         max_depth_not_exceeded = state.depth + 1 < max_depth
         proceed = np.logical_and(visited, max_depth_not_exceeded)
-
         return SelectionState(
             node_index,
             next_node_index,
@@ -262,10 +158,8 @@ def selection(
         action=np.array(UNVISITED),
         proceed=np.array(True),
     )
-
     while state.proceed:
         state = _selection(state)
-
     return SelectionOutput(state.node_index, state.action)
 
 
@@ -273,16 +167,11 @@ def expansion(
     tree: Tree,
     selection_output: SelectionOutput,
     next_node_index: int,
-    step_fn: Callable[[StepFnInput], StepFnReturn],
+    step_result: StepFnReturn,
 ) -> LeafNode:
     parent_index, action = selection_output
-    assert tree.children_indices[parent_index, action] == UNVISITED, (
-        f"Can only expand unvisited nodes, got {tree.children_indices[parent_index, action]=}"
-    )
-    embedding = tree.embeddings[parent_index]
-    value, reward, done, next_state = step_fn(
-        StepFnInput(embedding=embedding, action=action)
-    )
+    assert tree.children_indices[parent_index, action] == UNVISITED
+    value, reward, done, next_state = step_result
     tree.children_indices[parent_index, action] = next_node_index
     tree.action_from_parent[next_node_index] = action
     tree.parent_indices[next_node_index] = parent_index
@@ -291,47 +180,144 @@ def expansion(
     tree.node_is_terminal[next_node_index] = done
     tree.children_rewards[parent_index, action] = reward
     tree.embeddings[next_node_index] = next_state
-
-    return LeafNode(
-        node_index=next_node_index,
-        action=action,
-    )
+    return LeafNode(node_index=next_node_index, action=action)
 
 
-def backpropagate(tree: Tree, leaf_index: int) -> Tree:
+def backpropagate(tree: Tree, leaf_index: int) -> None:
     def _backpropagate(state: BackpropagationState) -> BackpropagationState:
-        tree, idx, value = state
+        tree, idx, _ = state
         parent = tree.parent_indices[idx]
         action = tree.action_from_parent[idx]
-
         reward = tree.children_rewards[parent, action]
-
         parent_value = tree.node_values[parent]
         parent_visits = tree.node_visits[parent]
-
         leaf_value = reward + state.value
         parent_value = (parent_value * parent_visits + leaf_value) / (
             parent_visits + 1.0
         )
-
         tree.node_values[parent] = parent_value
         tree.node_visits[parent] = parent_visits + 1
-
         tree.children_values[parent, action] = tree.node_values[idx]
         tree.children_visits[parent, action] = tree.children_visits[parent, action] + 1
-
         next_state = BackpropagationState(idx=parent, value=leaf_value, tree=tree)
-
         return next_state
 
     state = BackpropagationState(
         idx=leaf_index, value=tree.node_values[leaf_index], tree=tree
     )
-
     while state.idx != ROOT_INDEX:
         state = _backpropagate(state)
 
-    return state.tree
+
+def apply_virtual_loss(tree: Tree, leaf_node_index: int):
+    idx = leaf_node_index
+    if idx == NO_PARENT:
+        return
+    while idx != ROOT_INDEX:
+        tree.virtual_losses[idx] += 1
+        idx = tree.parent_indices[idx]
+    tree.virtual_losses[ROOT_INDEX] += 1
+
+
+def remove_virtual_loss(tree: Tree, leaf_node_index: int):
+    idx = leaf_node_index
+    if idx == NO_PARENT:
+        return
+    while idx != ROOT_INDEX:
+        tree.virtual_losses[idx] -= 1
+        idx = tree.parent_indices[idx]
+    tree.virtual_losses[ROOT_INDEX] -= 1
+
+
+def inference_worker(
+    n_workers: int,
+    step_queue: queue.Queue,
+    step_fn: Callable[[BatchedStepFnInput], BatchedStepFnReturn],
+    results_dict: dict[int, StepFnReturn],
+    batch_timeout_ms: int,
+):
+    while True:
+        try:
+            first_request = step_queue.get()
+            if first_request is None:
+                break
+
+            batch_requests = [first_request]
+            deadline = time.time() + (batch_timeout_ms / 1000)
+            while len(batch_requests) < n_workers and time.time() < deadline:
+                try:
+                    remaining_time = deadline - time.time()
+                    if remaining_time <= 0:
+                        break
+                    request = step_queue.get(timeout=remaining_time)
+                    if request is None:
+                        step_queue.put(None)
+                        break
+                    batch_requests.append(request)
+                except queue.Empty:
+                    break
+
+            request_ids = []
+            step_inputs = []
+
+            for req_id, step_input in batch_requests:
+                request_ids.append(req_id)
+                step_inputs.append(step_input)
+
+            embeddings = [inp.embedding for inp in step_inputs]
+            actions = np.array([inp.action for inp in step_inputs])
+            batched_input = BatchedStepFnInput(embeddings=embeddings, actions=actions)
+            batched_output = step_fn(batched_input)
+
+            for i, request_id in enumerate(request_ids):
+                result = StepFnReturn(
+                    value=batched_output.value[i],
+                    reward=batched_output.reward[i],
+                    done=batched_output.done[i],
+                    embedding=batched_output.embedding[i],
+                )
+                results_dict[request_id] = result
+        except Exception:
+            continue
+
+
+def run_simulation(args):
+    (
+        iteration,
+        tree,
+        step_queue,
+        results_dict,
+        max_depth,
+        inner_action_selection_fn,
+    ) = args
+
+    selection_output = selection(tree, max_depth, inner_action_selection_fn)
+    parent_index = selection_output.parent_index
+    action = selection_output.action
+    apply_virtual_loss(tree, parent_index)
+    if tree.children_indices[parent_index, action] == UNVISITED:
+        request_id = iteration
+        embedding = tree.embeddings[parent_index]
+        step_input = StepFnInput(embedding=embedding, action=action)
+        step_queue.put((request_id, step_input))
+
+        while request_id not in results_dict:
+            time.sleep(0.0001)
+        step_result = results_dict.pop(request_id)
+
+        if tree.children_indices[parent_index, action] == UNVISITED:
+            node_index_counter = iteration + 1
+            leaf_node = expansion(
+                tree, selection_output, node_index_counter, step_result
+            )
+        else:
+            child_idx = tree.children_indices[parent_index, action]
+            leaf_node = LeafNode(node_index=child_idx, action=action)
+    else:
+        child_idx = tree.children_indices[parent_index, action]
+        leaf_node = LeafNode(node_index=child_idx, action=action)
+    remove_virtual_loss(tree, parent_index)
+    backpropagate(tree, leaf_node.node_index)
 
 
 class MCTS:
@@ -342,37 +328,35 @@ class MCTS:
         inner_action_selection_fn: Callable[
             [ActionSelectionInput], ActionSelectionReturn
         ],
-        step_fn: Callable[[StepFnInput], StepFnReturn],
+        step_fn: Callable[[BatchedStepFnInput], BatchedStepFnReturn],
         max_depth: int,
         n_iterations: int,
+        n_workers: int,
+        batch_timeout_ms: int = 1,
     ):
-        node_index_counter = 0
+        assert n_workers >= 1
+        manager = multiprocessing.Manager()
+        step_queue = manager.Queue()
+        results_dict = manager.dict()
         tree = generate_tree(
             n_nodes=n_iterations + 1, n_actions=n_actions, root_fn_output=root_fn()
         )
-
-        for iteration in range(n_iterations):
-            selection_output = selection(tree, max_depth, inner_action_selection_fn)
-
-            if (
-                tree.children_indices[
-                    selection_output.parent_index, selection_output.action
-                ]
-                == UNVISITED
-            ):
-                node_index_counter += 1
-                leaf_node = expansion(
-                    tree, selection_output, node_index_counter, step_fn
-                )
-            else:
-                child_idx = tree.children_indices[
-                    selection_output.parent_index, selection_output.action
-                ]
-                leaf_node = LeafNode(
-                    node_index=child_idx,
-                    action=selection_output.action,
-                )
-
-            tree = backpropagate(tree, leaf_node.node_index)
-
+        inference_thread = multiprocessing.Process(
+            target=inference_worker,
+            args=(n_workers, step_queue, step_fn, results_dict, batch_timeout_ms),
+            daemon=True,
+        )
+        inference_thread.start()
+        with multiprocessing.pool.ThreadPool(processes=n_workers) as pool:
+            simulation_args = (
+                tree,
+                step_queue,
+                results_dict,
+                max_depth,
+                inner_action_selection_fn,
+            )
+            args_for_map = [(i,) + simulation_args for i in range(n_iterations)]
+            pool.map(run_simulation, args_for_map)
+        step_queue.put(None)
+        inference_thread.join(timeout=1)
         return tree

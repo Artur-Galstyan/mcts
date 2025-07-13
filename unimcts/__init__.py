@@ -1,4 +1,4 @@
-from .mctsvl import (
+from .mcts import (
     MCTS,
     ROOT_INDEX,
     UNVISITED,
