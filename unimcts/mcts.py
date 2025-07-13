@@ -1,10 +1,10 @@
 import multiprocessing
 import multiprocessing.pool
 import queue
+import threading
 import time
 from dataclasses import dataclass
 
-import gymnasium as gym
 import numpy as np
 from beartype.typing import Any, Callable, NamedTuple
 from jaxtyping import Bool, Float, Int
@@ -27,6 +27,7 @@ class Tree:
     children_visits: Int[np.ndarray, "n_nodes n_actions"]
     children_rewards: Float[np.ndarray, "n_nodes n_actions"]
     embeddings: dict[Int, Any]
+    node_locks: list[threading.Lock]
 
 
 class RootFnOutput(NamedTuple):
@@ -103,6 +104,7 @@ def generate_tree(n_nodes: int, n_actions: int, root_fn_output: RootFnOutput) ->
     node_is_terminal = np.zeros(shape=(n_nodes), dtype=bool)
     virtual_losses = np.zeros(shape=(n_nodes), dtype=np.int32)
     embeddings = {ROOT_INDEX: root_fn_output.embedding}
+    node_locks = [threading.Lock() for _ in range(n_nodes)]
     node_visits[ROOT_INDEX] = 1
     return Tree(
         parent_indices=parent_indices,
@@ -116,6 +118,7 @@ def generate_tree(n_nodes: int, n_actions: int, root_fn_output: RootFnOutput) ->
         children_rewards=children_rewards,
         virtual_losses=virtual_losses,
         embeddings=embeddings,
+        node_locks=node_locks,
     )
 
 
@@ -170,17 +173,51 @@ def expansion(
     step_result: StepFnReturn,
 ) -> LeafNode:
     parent_index, action = selection_output
-    assert tree.children_indices[parent_index, action] == UNVISITED
     value, reward, done, next_state = step_result
-    tree.children_indices[parent_index, action] = next_node_index
-    tree.action_from_parent[next_node_index] = action
-    tree.parent_indices[next_node_index] = parent_index
-    tree.node_values[next_node_index] = value
-    tree.node_visits[next_node_index] = 1
-    tree.node_is_terminal[next_node_index] = done
-    tree.children_rewards[parent_index, action] = reward
-    tree.embeddings[next_node_index] = next_state
+
+    with tree.node_locks[parent_index]:
+        if tree.children_indices[parent_index, action] != UNVISITED:
+            actual_node_index = tree.children_indices[parent_index, action]
+            return LeafNode(node_index=actual_node_index, action=action)
+
+        tree.children_indices[parent_index, action] = next_node_index
+        tree.children_rewards[parent_index, action] = reward
+
+    with tree.node_locks[next_node_index]:
+        tree.action_from_parent[next_node_index] = action
+        tree.parent_indices[next_node_index] = parent_index
+        tree.node_values[next_node_index] = value
+        tree.node_visits[next_node_index] = 1
+        tree.node_is_terminal[next_node_index] = done
+        tree.embeddings[next_node_index] = next_state
+
     return LeafNode(node_index=next_node_index, action=action)
+
+
+def apply_virtual_loss(tree: Tree, leaf_node_index: int):
+    idx = leaf_node_index
+    if idx == NO_PARENT:
+        return
+    while idx != ROOT_INDEX:
+        with tree.node_locks[idx]:
+            tree.virtual_losses[idx] += 1
+        idx = tree.parent_indices[idx]
+
+    with tree.node_locks[ROOT_INDEX]:
+        tree.virtual_losses[ROOT_INDEX] += 1
+
+
+def remove_virtual_loss(tree: Tree, leaf_node_index: int):
+    idx = leaf_node_index
+    if idx == NO_PARENT:
+        return
+    while idx != ROOT_INDEX:
+        with tree.node_locks[idx]:
+            tree.virtual_losses[idx] -= 1
+        idx = tree.parent_indices[idx]
+
+    with tree.node_locks[ROOT_INDEX]:
+        tree.virtual_losses[ROOT_INDEX] -= 1
 
 
 def backpropagate(tree: Tree, leaf_index: int) -> None:
@@ -188,17 +225,22 @@ def backpropagate(tree: Tree, leaf_index: int) -> None:
         tree, idx, _ = state
         parent = tree.parent_indices[idx]
         action = tree.action_from_parent[idx]
-        reward = tree.children_rewards[parent, action]
-        parent_value = tree.node_values[parent]
-        parent_visits = tree.node_visits[parent]
-        leaf_value = reward + state.value
-        parent_value = (parent_value * parent_visits + leaf_value) / (
-            parent_visits + 1.0
-        )
-        tree.node_values[parent] = parent_value
-        tree.node_visits[parent] = parent_visits + 1
-        tree.children_values[parent, action] = tree.node_values[idx]
-        tree.children_visits[parent, action] = tree.children_visits[parent, action] + 1
+
+        with tree.node_locks[parent]:
+            reward = tree.children_rewards[parent, action]
+            parent_value = tree.node_values[parent]
+            parent_visits = tree.node_visits[parent]
+            leaf_value = reward + state.value
+            new_parent_value = (parent_value * parent_visits + leaf_value) / (
+                parent_visits + 1.0
+            )
+            tree.node_values[parent] = new_parent_value
+            tree.node_visits[parent] = parent_visits + 1
+            tree.children_values[parent, action] = tree.node_values[idx]
+            tree.children_visits[parent, action] = (
+                tree.children_visits[parent, action] + 1
+            )
+
         next_state = BackpropagationState(idx=parent, value=leaf_value, tree=tree)
         return next_state
 
@@ -207,26 +249,6 @@ def backpropagate(tree: Tree, leaf_index: int) -> None:
     )
     while state.idx != ROOT_INDEX:
         state = _backpropagate(state)
-
-
-def apply_virtual_loss(tree: Tree, leaf_node_index: int):
-    idx = leaf_node_index
-    if idx == NO_PARENT:
-        return
-    while idx != ROOT_INDEX:
-        tree.virtual_losses[idx] += 1
-        idx = tree.parent_indices[idx]
-    tree.virtual_losses[ROOT_INDEX] += 1
-
-
-def remove_virtual_loss(tree: Tree, leaf_node_index: int):
-    idx = leaf_node_index
-    if idx == NO_PARENT:
-        return
-    while idx != ROOT_INDEX:
-        tree.virtual_losses[idx] -= 1
-        idx = tree.parent_indices[idx]
-    tree.virtual_losses[ROOT_INDEX] -= 1
 
 
 def inference_worker(
@@ -277,8 +299,11 @@ def inference_worker(
                     embedding=batched_output.embedding[i],
                 )
                 results_dict[request_id] = result
-        except Exception:
-            continue
+        except Exception as _:
+            import traceback
+
+            traceback.print_exc()
+            break
 
 
 def run_simulation(args):
