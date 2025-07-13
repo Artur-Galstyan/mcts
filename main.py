@@ -147,8 +147,8 @@ if __name__ == "__main__":
 
     start_time = time.time()
 
-    n_iterations = 10_000
-    n_workers = 32
+    n_iterations = 20_000
+    n_workers = 16
 
     tree = MCTS.search(
         n_actions=env.action_space.n,
