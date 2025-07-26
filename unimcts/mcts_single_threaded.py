@@ -132,19 +132,17 @@ def backpropagate(tree: Tree, leaf_index: int) -> Tree:
         p = tree.parent_indices[idx]
         a = tree.action_from_parent[idx]
 
-        total_return_from_path = tree.r_sa[p][a] + value_to_propagate
+        total_return = tree.r_sa[p][a] + value_to_propagate  # G = R(s, a) + V(s')
 
-        tree.v_s[p] = (tree.v_s[p] * tree.n_s[p] + total_return_from_path) / (
-            tree.n_s[p] + 1
-        )
+        tree.v_s[p] = (tree.v_s[p] * tree.n_s[p] + total_return) / (tree.n_s[p] + 1)
         tree.n_s[p] += 1
 
         q = tree.q_sa[p][a]
         n_sa = tree.n_sa[p][a]
-        tree.q_sa[p][a] = (q * n_sa + total_return_from_path) / (n_sa + 1)
+        tree.q_sa[p][a] = (q * n_sa + total_return) / (n_sa + 1)
         tree.n_sa[p][a] += 1
 
-        value_to_propagate = total_return_from_path
+        value_to_propagate = total_return
         idx = p
 
     return tree
@@ -194,6 +192,7 @@ class MCTS:
 
 import math
 import random
+import time
 
 import gymnasium as gym
 
@@ -207,17 +206,13 @@ def ucb1_fn_factory(
         tree = policy_input.tree
         node_index = policy_input.node_index
         n_actions = len(tree.children_indices[node_index])
-
         parent_visits = tree.n_s[node_index]
         if parent_visits == 0:
             return PolicyReturn(action=random.randint(0, n_actions - 1))
-
         best_action = -1
         max_ucb_score = -float("inf")
-
         for action in range(n_actions):
             child_visits = tree.n_sa[node_index][action]
-
             if child_visits == 0:
                 ucb_score = float("inf")
             else:
@@ -226,11 +221,9 @@ def ucb1_fn_factory(
                     math.log(parent_visits) / child_visits
                 )
                 ucb_score = exploitation_score + exploration_score
-
             if ucb_score > max_ucb_score:
                 max_ucb_score = ucb_score
                 best_action = action
-
         return PolicyReturn(action=best_action)
 
     return ucb1_action_selection_fn
@@ -238,7 +231,7 @@ def ucb1_fn_factory(
 
 def root_fn_factory(env_name: str) -> Callable[[], RootFnOutput]:
     def root_fn() -> RootFnOutput:
-        env = gym.make(env_name)
+        env = gym.make(env_name, is_slippery=False)
         initial_state, info = env.reset()
         env.close()
         return RootFnOutput(state=initial_state)
@@ -280,47 +273,83 @@ def step_fn_factory(env_name: str) -> Callable[[StepFnInput], StepFnReturn]:
     return step_fn
 
 
-def random_action_selection_fn(
-    policy_input: PolicyInput,
-) -> PolicyReturn:
-    n_actions = len(policy_input.tree.children_indices[0])
-    action = random.randint(0, n_actions - 1)
-    return PolicyReturn(action=action)
+def find_best_action(tree: Tree, node_index: int) -> int:
+    action_visits = tree.n_sa[node_index]
+    return max(range(len(action_visits)), key=lambda i: action_visits[i])
 
 
-def find_best_action(tree: Tree) -> int:
-    root_child_visits = tree.n_sa[ROOT_INDEX]
-    best_action = max(range(len(root_child_visits)), key=lambda i: root_child_visits[i])
-    return best_action
+def evaluate_and_render(tree: Tree, env_name: str):
+    print("\n--- Running Evaluation ---")
+    env = gym.make(env_name, render_mode="human")
+    state_to_node_idx = {state: idx for idx, state in tree.states.items()}
+
+    state, _ = env.reset()
+    for step in range(env.spec.max_episode_steps):  # pyright: ignore
+        if state in state_to_node_idx:
+            node_idx = state_to_node_idx[state]
+            action = find_best_action(tree, node_idx)
+            print(
+                f"Step {step + 1}: State {state} is in tree. Taking best action: {action}"
+            )
+        else:
+            action = env.action_space.sample()
+            print(
+                f"Step {step + 1}: State {state} not in tree. Taking random action: {action}"
+            )
+
+        state, reward, done, truncated, _ = env.step(action)
+        time.sleep(0.5)
+
+        if done or truncated:
+            print(f"Episode finished after {step + 1} steps. Final reward: {reward}")
+            break
+
+    env.close()
 
 
 def main():
     ENV_NAME = "FrozenLake-v1"
     N_ACTIONS = 4
-    N_ITERATIONS = 100
-    MAX_DEPTH = 15
-    EXPLORATION_CONSTANT = 1.2
+    N_ITERATIONS = 500
+    MAX_DEPTH = 50
+    EXPLORATION_CONSTANT = 1.5
 
-    root_fn = root_fn_factory(ENV_NAME)
     step_fn = step_fn_factory(ENV_NAME)
     ucb1_fn = ucb1_fn_factory(EXPLORATION_CONSTANT)
 
-    final_tree = MCTS.search(
-        n_actions=N_ACTIONS,
-        root_fn=root_fn,
-        policy_fn=ucb1_fn,
-        step_fn=step_fn,
-        max_depth=MAX_DEPTH,
-        n_iterations=N_ITERATIONS,
-    )
+    env = gym.make(ENV_NAME, render_mode="human")
+    current_state, info = env.reset()
 
-    best_action = find_best_action(final_tree)
     action_map = {0: "Left", 1: "Down", 2: "Right", 3: "Up"}
 
-    print(f"Search complete after {N_ITERATIONS} iterations.")
-    print(f"Root visit counts: {final_tree.n_sa[ROOT_INDEX]}")
-    print(f"Root values: {[f'{v:.3f}' for v in final_tree.q_sa[ROOT_INDEX]]}")
-    print(f"Best action from root: {action_map[best_action]} ({best_action})")
+    for step in range(env.spec.max_episode_steps):
+        print(f"\n--- Step {step + 1}: Planning from state {current_state} ---")
+
+        root_fn = lambda: RootFnOutput(state=current_state)
+
+        tree = MCTS.search(
+            n_actions=N_ACTIONS,
+            root_fn=root_fn,
+            policy_fn=ucb1_fn,
+            step_fn=step_fn,
+            max_depth=MAX_DEPTH,
+            n_iterations=N_ITERATIONS,
+        )
+
+        best_action = find_best_action(tree, ROOT_INDEX)
+        print(f"Root visits: {tree.n_sa[ROOT_INDEX]}")
+        print(f"Best action selected: {action_map[best_action]} ({best_action})")
+
+        next_state, reward, done, truncated, info = env.step(best_action)
+        time.sleep(0.25)
+
+        current_state = next_state
+
+        if done or truncated:
+            print(f"\nEpisode finished after {step + 1} steps. Final reward: {reward}")
+            break
+
+    env.close()
 
 
 if __name__ == "__main__":
