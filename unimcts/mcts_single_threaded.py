@@ -24,54 +24,21 @@ class Tree:
     states: dict[int, Any]
 
 
-class RootFnOutput(NamedTuple):
-    state: Any
+RootFnOutput = NamedTuple("RootFnOutput", [("state", Any)])
+PolicyInput = NamedTuple(
+    "PolicyInput", [("tree", Tree), ("node_index", int), ("depth", int)]
+)
+PolicyReturn = NamedTuple("PolicyReturn", [("action", int)])
+SelectionOutput = NamedTuple(
+    "SelectionOutput", [("parent_index", int), ("action", int)]
+)
 
-
-class PolicyInput(NamedTuple):
-    tree: Tree
-    node_index: int
-    depth: int
-
-
-class PolicyReturn(NamedTuple):
-    action: int
-
-
-class SelectionOutput(NamedTuple):
-    parent_index: int
-    action: int
-
-
-class StepFnInput(NamedTuple):
-    state: Any
-    action: int
-
-
-class StepFnReturn(NamedTuple):
-    value: float
-    reward: float
-    done: bool
-    state: Any
-
-
-class LeafNode(NamedTuple):
-    node_index: int
-    action: int
-
-
-class BackpropagationState(NamedTuple):
-    tree: Tree
-    idx: int
-    value: float
-
-
-class SelectionState(NamedTuple):
-    node_index: int
-    next_node_index: int
-    depth: int
-    action: int
-    proceed: bool
+StepFnInput = NamedTuple("StepFnInput", [("state", Any), ("action", int)])
+StepFnReturn = NamedTuple(
+    "StepFnReturn",
+    [("value", float), ("reward", float), ("done", bool), ("state", Any)],
+)
+LeafNode = NamedTuple("LeafNode", [("node_index", int), ("action", int)])
 
 
 def generate_tree(n_nodes: int, n_actions: int, root_fn_output: RootFnOutput) -> Tree:
@@ -108,45 +75,26 @@ def selection(
     max_depth: int,
     policy_fn: Callable[[PolicyInput], PolicyReturn],
 ) -> SelectionOutput:
-    def _selection(state: SelectionState) -> SelectionState:
-        node_index = state.next_node_index
-        if tree.dones[node_index]:
-            return SelectionState(
-                node_index=state.node_index,
-                next_node_index=node_index,
-                depth=state.depth,
-                action=state.action,
-                proceed=False,
-            )
+    n = ROOT_INDEX
+    p = NO_PARENT
+    a = UNVISITED
+    depth = 0
 
-        action_selection_output = policy_fn(PolicyInput(tree, node_index, state.depth))
-        next_node_index = tree.children_indices[node_index][
-            action_selection_output.action
-        ]
-        child_exists = next_node_index != UNVISITED
-        max_depth_not_exceeded = state.depth + 1 < max_depth
-        proceed = child_exists and max_depth_not_exceeded
+    while True:
+        if tree.dones[n] or depth >= max_depth:
+            return SelectionOutput(p, a)
 
-        return SelectionState(
-            node_index,
-            next_node_index,
-            state.depth + 1,
-            action_selection_output.action,
-            proceed,
-        )
+        policy = policy_fn(PolicyInput(tree, n, depth))
 
-    state = SelectionState(
-        node_index=NO_PARENT,
-        next_node_index=ROOT_INDEX,
-        depth=0,
-        action=UNVISITED,
-        proceed=True,
-    )
+        c = tree.children_indices[n][policy.action]
 
-    while state.proceed:
-        state = _selection(state)
-
-    return SelectionOutput(state.node_index, state.action)
+        if c == UNVISITED:
+            return SelectionOutput(n, policy.action)
+        else:
+            p = n
+            n = c
+            a = policy.action
+            depth += 1
 
 
 def expansion(
@@ -177,37 +125,29 @@ def expansion(
 
 
 def backpropagate(tree: Tree, leaf_index: int) -> Tree:
-    def _backpropagate(state: BackpropagationState) -> BackpropagationState:
-        tree, idx, value = state
-        parent = tree.parent_indices[idx]
-        action = tree.action_from_parent[idx]
+    idx = leaf_index
+    value_to_propagate = tree.v_s[idx]
 
-        reward = tree.r_sa[parent][action]
+    while idx != ROOT_INDEX:
+        p = tree.parent_indices[idx]
+        a = tree.action_from_parent[idx]
 
-        parent_value = tree.v_s[parent]
-        parent_visits = tree.n_s[parent]
+        total_return_from_path = tree.r_sa[p][a] + value_to_propagate
 
-        leaf_value = reward + state.value
-        parent_value = (parent_value * parent_visits + leaf_value) / (
-            parent_visits + 1.0
+        tree.v_s[p] = (tree.v_s[p] * tree.n_s[p] + total_return_from_path) / (
+            tree.n_s[p] + 1
         )
+        tree.n_s[p] += 1
 
-        tree.v_s[parent] = parent_value
-        tree.n_s[parent] = parent_visits + 1
+        q = tree.q_sa[p][a]
+        n_sa = tree.n_sa[p][a]
+        tree.q_sa[p][a] = (q * n_sa + total_return_from_path) / (n_sa + 1)
+        tree.n_sa[p][a] += 1
 
-        tree.q_sa[parent][action] = tree.v_s[idx]
-        tree.n_sa[parent][action] = tree.n_sa[parent][action] + 1
+        value_to_propagate = total_return_from_path
+        idx = p
 
-        next_state = BackpropagationState(idx=parent, value=leaf_value, tree=tree)
-
-        return next_state
-
-    state = BackpropagationState(idx=leaf_index, value=tree.v_s[leaf_index], tree=tree)
-
-    while state.idx != ROOT_INDEX:
-        state = _backpropagate(state)
-
-    return state.tree
+    return tree
 
 
 class MCTS:
